@@ -1,0 +1,23 @@
+OpexAI changelog
+================
+
+1.0.0 (AI version 9) - unreleased
+---------------------------------
+
+First public release. Requires OpenTTD 15 or later (AI API 15).
+
+- Multimodal company: railways, road vehicles (buses and trucks), aircraft
+  and ships; each mode can be switched off.
+- Routes compared across modes by expected return on investment, within the
+  money available to the company.
+- Construction of stations, track, roads, airports, docks and depots, then
+  vehicle purchases and fleet growth on existing lines.
+- Savegame support.
+- Several OpexAI companies can share a game ("OpexAI", "OpexAI #2", ...).
+- No dependency on AI libraries from Online Content.
+- Seven settings: difficulty, use_trains, use_road_vehicles, use_aircraft,
+  use_ships, show_signs, log_level. No debug signs and no decision log by
+  default.
+- Known limitation: tested only in the temperate climate, on maps from
+  256x256 to 1024x1024 tiles, starting in 1970, with default OpenGFX
+  vehicles and no NewGRFs.

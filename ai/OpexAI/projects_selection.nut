@@ -1,0 +1,1888 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 jrdoublet
+/* Extrait de projects.nut (R14) : Politiques de selection : slots early/defensifs, C121/C122, reserve AIR, selection financable. Requis depuis projects.nut. */
+
+/* Diagnostic R1/R3, jamais un reglage de politique. Le harnais active uniquement
+ * cette constante dans une COPIE test-only identifiee et hachee. Etat transitoire,
+ * non persiste : les identites doivent etre namespacees par flux/phase au lecteur. */
+const R1_R3_TEST_ONLY = 0;
+R1_R3_TEST_SEQ <- 0;
+R1_R3_TEST_PASS <- 0;
+
+/* C121 autopsie causale : sonde compile-time uniquement, jamais un reglage de
+ * politique. Elle serialise exclusivement l'etat deja calcule par le selecteur ;
+ * pas de second tri, pas de nouveau modele economique, pas de scan de carte. */
+const C121_AUTOPSY_TEST_ONLY = 0;
+C121_AUTOPSY_SELECTION_SEQ <- 0;
+C121_AUTOPSY_DONE <- false;
+
+function OpexR1R3Log(fields)
+{
+  if (!R1_R3_TEST_ONLY) return;
+  OpexDiagLog("R1R3 test_only=1 date=" + AIDate.GetCurrentDate()
+      + " tick=" + AIController.GetTick() + " " + fields);
+}
+
+function OpexC121AutopsyLog(kind, fields)
+{
+  if (!C121_AUTOPSY_TEST_ONLY) return;
+  local date = AIDate.GetCurrentDate();
+  OpexDiagLog("C121_AUTOPSY kind=" + kind + " date=" + date
+      + " y=" + AIDate.GetYear(date) + " m=" + AIDate.GetMonth(date)
+      + " d=" + AIDate.GetDayOfMonth(date) + " tick=" + AIController.GetTick()
+      + " " + fields);
+}
+
+function OpexC121AutopsyIsAirRelated(project)
+{
+  if (project == null || !("mode" in project)) return false;
+  if (project.mode == "air") return true;
+  if (project.mode != "fleet" || !("payload" in project) || project.payload == null
+      || !("line" in project.payload) || project.payload.line == null) return false;
+  local line = project.payload.line;
+  return ("mode" in line) && line.mode == "air";
+}
+
+function OpexC121AutopsyProjectFields(project, rank, seq)
+{
+  if (project == null || !("mode" in project)) return "seq=" + seq + " rank=" + rank + " mode=unknown";
+  local mode = project.mode;
+  local fields = "seq=" + seq + " rank=" + rank + " mode=" + mode
+      + " key=" + OpexProjectAttemptKey(project)
+      + " profit=" + (("profitAnnual" in project) ? project.profitAnnual : 0)
+      + " revenue=" + (("revenueAnnual" in project) ? project.revenueAnnual : 0)
+      + " finance=" + OpexProjectFinanceCapital(project)
+      + " decision_finance=" + (("decisionFinanceCapital" in project) ? project.decisionFinanceCapital : -1)
+      + " portfolio_finance=" + (("portfolioDecisionFinanceCapital" in project) ? project.portfolioDecisionFinanceCapital : -1)
+      + " portfolio_profit=" + (("portfolioProfitAnnual" in project) ? project.portfolioProfitAnnual : -1)
+      + " fund_score=" + (("fundScore" in project) ? project.fundScore : 0)
+      + " early_bonus=" + (("earlySlotBonusPct" in project) ? project.earlySlotBonusPct : 0)
+      + " defensive_comp=" + (("defensiveCompetitorClaims" in project) ? project.defensiveCompetitorClaims : 0)
+      + " defensive_own=" + (("defensiveOwnClaims" in project) ? project.defensiveOwnClaims : 0)
+      + " defensive_new=" + (("defensiveNewTownClaims" in project) ? project.defensiveNewTownClaims : 0);
+
+  if (mode == "air" && ("payload" in project) && project.payload != null) {
+    local plan = project.payload;
+    local econ = ("economics" in plan) ? plan.economics : null;
+    local dec = ("decisionEconomics" in plan) ? plan.decisionEconomics : null;
+    local port = ("portfolioEconomics" in plan) ? plan.portfolioEconomics : null;
+    local demand = ("c121Demand" in plan) ? plan.c121Demand : null;
+    local townA = ("siteA" in plan && plan.siteA != null && "town" in plan.siteA
+        && plan.siteA.town != null && "id" in plan.siteA.town) ? plan.siteA.town.id : -1;
+    local townB = ("siteB" in plan && plan.siteB != null && "town" in plan.siteB
+        && plan.siteB.town != null && "id" in plan.siteB.town) ? plan.siteB.town.id : -1;
+    fields += " arm=" + (("arm" in plan) ? plan.arm : "unknown")
+        + " town_a=" + townA + " town_b=" + townB
+        + " distance=" + (("distance" in plan) ? plan.distance : (("distance" in project) ? project.distance : -1))
+        + " monthly_pax=" + (("monthlyPax" in plan) ? plan.monthlyPax : -1)
+        + " demand_pax_a=" + (demand != null && ("paxA" in demand) ? demand.paxA : -1)
+        + " demand_pax_b=" + (demand != null && ("paxB" in demand) ? demand.paxB : -1)
+        + " demand_mail_a=" + (demand != null && ("mailA" in demand) ? demand.mailA : -1)
+        + " demand_mail_b=" + (demand != null && ("mailB" in demand) ? demand.mailB : -1)
+        + " econ_profit=" + (econ != null && ("profitAnnual" in econ) ? econ.profitAnnual : -1)
+        + " econ_capital=" + (econ != null && ("capital" in econ) ? econ.capital : -1)
+        + " econ_planes=" + (econ != null && ("planes" in econ) ? econ.planes : -1)
+        + " decision_profit=" + (dec != null && ("profitAnnual" in dec) ? dec.profitAnnual : -1)
+        + " decision_capital=" + (dec != null && ("capital" in dec) ? dec.capital : -1)
+        + " decision_planes=" + (dec != null && ("planes" in dec) ? dec.planes : -1)
+        + " portfolio_econ_profit=" + (port != null && ("profitAnnual" in port) ? port.profitAnnual : -1)
+        + " portfolio_econ_capital=" + (port != null && ("capital" in port) ? port.capital : -1)
+        + " target_planes=" + (("targetPlanes" in plan) ? plan.targetPlanes : -1)
+        + " plane_price=" + (("plane" in plan) && plan.plane != null && ("price" in plan.plane) ? plan.plane.price : -1)
+        + " airport_price=" + (("airport" in plan) && plan.airport != null && ("price" in plan.airport) ? plan.airport.price : -1)
+        + " reuse_a=" + ((("reuseA" in plan) && plan.reuseA) ? 1 : 0)
+        + " reuse_b=" + ((("reuseB" in plan) && plan.reuseB) ? 1 : 0)
+        + " defensive_town_a=" + (("defensiveSlotTownA" in project) ? project.defensiveSlotTownA : -1)
+        + " defensive_town_b=" + (("defensiveSlotTownB" in project) ? project.defensiveSlotTownB : -1);
+  } else if (mode == "fleet" && OpexC121AutopsyIsAirRelated(project)) {
+    local entry = project.payload;
+    local line = entry.line;
+    fields += " line=" + (("lineId" in line) ? line.lineId : -1)
+        + " want=" + (("want" in entry) ? entry.want : -1)
+        + " have=" + (("vehCount" in line) ? line.vehCount : (("vehicles" in line) ? line.vehicles.len() : -1))
+        + " target_planes=" + (("targetAirPlanes" in line) ? line.targetAirPlanes : -1)
+        + " marginal_samples=" + (("c121MarginalSamples" in line) ? line.c121MarginalSamples : -1)
+        + " marginal_profit=" + (("c121MarginalProfit" in line) ? line.c121MarginalProfit : -1)
+        + " marginal_revenue=" + (("c121MarginalRevenue" in line) ? line.c121MarginalRevenue : -1)
+        + " plane_price=" + (("planePrice" in entry) ? entry.planePrice : -1);
+  }
+  return fields;
+}
+
+/* Observation du retour EXISTANT du fit, pas de seconde evaluation. Ne touche
+ * ni au vivier ni a son payload : seule la copie admise porte la filiation. */
+function OpexR1R3FitTrace(project, fitted, budget)
+{
+  if (project == null || project.mode != "fleet") return fitted;
+  R1_R3_TEST_SEQ++;
+  local entry = project.payload;
+  local line = entry.line;
+  local id = "f" + R1_R3_TEST_SEQ;
+  local fields = "mechanism=R1 phase=fit id=" + id
+      + " line=" + (line != null && ("lineId" in line) ? line.lineId : -1)
+      + " src=" + project.src + " dst=" + project.dst
+      + " original=" + entry.want + " fitted=" + (fitted != null ? fitted.payload.want : "unknown")
+      + " admitted=" + (fitted != null ? 1 : 0)
+      + " base=" + (("baseVehicles" in entry) ? entry.baseVehicles : "unknown")
+      + " have=" + (line != null ? (("vehCount" in line) ? line.vehCount : line.vehicles.len()) : "unknown")
+      + " scrapping=" + (line == null || (("scrapping" in line) && line.scrapping) ? 1 : 0)
+      + " budget=" + budget + " price=" + entry.planePrice
+      + " buffer=1000"
+      + " cash=" + AICompany.GetBankBalance(AICompany.COMPANY_SELF);
+  OpexR1R3Log(fields);
+  if (fitted == null) return null;
+  local traced = clone fitted;
+  traced.r1r3Id <- id;
+  return traced;
+}
+
+/* Early-slot doit observer l'etat VIVANT au moment du choix final, pas au moment
+ * ou OpexAirPlans a genere le candidat. Un vivier peut etre reutilise/reselecte
+ * apres un chantier : une annotation faite plus tot deviendrait alors perimee et
+ * pourrait continuer a bonifier une ville deja securisee. On scanne donc les
+ * aeroports physiques Opex une seule fois par passe de selection. */
+function OpexEarlySlotSelectionState()
+{
+  local state = { servedTowns = {}, servedCount = 0 };
+
+  local ownAirports = AIStationList(AIStation.STATION_AIRPORT);
+  for (local st = ownAirports.Begin(); !ownAirports.IsEnd(); st = ownAirports.Next()) {
+    local townId = AIStation.GetNearestTown(st);
+    if (townId < 0 || !AITown.IsValidTown(townId)) continue;
+    if (AITown.GetPopulation(townId) < AIR_EARLY_SLOT_MIN_POP) continue;
+    if (townId in state.servedTowns) continue;
+    state.servedTowns.rawset(townId, true);
+    state.servedCount++;
+  }
+  return state;
+}
+
+function OpexDefensiveSlotSelectionState(earlySlotState = null)
+{
+  local state = {
+    servedTowns = {}, servedCount = 0,
+    slotRemaining = {}, defensiveSlotSignal = false,
+  };
+
+  if (earlySlotState != null) {
+    state.servedTowns = earlySlotState.servedTowns;
+    state.servedCount = earlySlotState.servedCount;
+  } else {
+    local ownAirports = AIStationList(AIStation.STATION_AIRPORT);
+    for (local st = ownAirports.Begin(); !ownAirports.IsEnd(); st = ownAirports.Next()) {
+      local townId = AIStation.GetNearestTown(st);
+      if (townId < 0 || !AITown.IsValidTown(townId)) continue;
+      if (AITown.GetPopulation(townId) < AIR_EARLY_SLOT_MIN_POP) continue;
+      if (townId in state.servedTowns) continue;
+      state.servedTowns.rawset(townId, true);
+      state.servedCount++;
+    }
+  }
+
+  state.defensiveSlotSignal = OpexAirC83SlotSignalEnabled();
+  return state;
+}
+
+function OpexC83TownSlotsRemaining(townId, state)
+{
+  if (state == null || townId < 0 || !AITown.IsValidTown(townId)) return -1;
+  if (!("defensiveSlotSignal" in state) || !state.defensiveSlotSignal) return -1;
+  if (!(townId in state.slotRemaining)) {
+    state.slotRemaining.rawset(townId, AITown.GetAllowedNoise(townId));
+  }
+  return state.slotRemaining[townId];
+}
+
+function OpexC121PressureNewAccum(year)
+{
+  return { year = year, towns = {}, samples = 0 };
+}
+
+/* Cloture l'annee de pression avant le premier scoring de la suivante. Le
+ * classifieur adaptatif lit donc toujours une annee complete et stable. */
+function OpexC121PressureAdvanceYear()
+{
+  local year = AIDate.GetYear(AIDate.GetCurrentDate());
+  if (C121_AIR_PRESSURE_ACCUM == null) {
+    C121_AIR_PRESSURE_ACCUM = OpexC121PressureNewAccum(year);
+    return;
+  }
+  if (C121_AIR_PRESSURE_ACCUM.year == year) return;
+  local open = 0;
+  local competitor = 0;
+  local locked = 0;
+  local other = 0;
+  foreach (townId, remaining in C121_AIR_PRESSURE_ACCUM.towns) {
+    if (remaining >= 2) open++;
+    else if (remaining == 1) competitor++;
+    else if (remaining == 0) locked++;
+    else other++;
+  }
+  local pressured = competitor + locked;
+  local contestablePermille = pressured > 0
+      ? (competitor * 1000) / pressured : -1;
+  local observedUseful = open + pressured;
+  local openPermille = observedUseful > 0
+      ? (open * 1000) / observedUseful : -1;
+  C121_AIR_PRESSURE_PREV = {
+    year = C121_AIR_PRESSURE_ACCUM.year,
+    open = open,
+    competitor = competitor,
+    locked = locked,
+    other = other,
+    uniqueTowns = C121_AIR_PRESSURE_ACCUM.towns.len(),
+    samples = C121_AIR_PRESSURE_ACCUM.samples,
+    pressured = pressured,
+    contestablePermille = contestablePermille,
+    openPermille = openPermille,
+  };
+  C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED++;
+  if (C121_AIR_PROJECT_REALIZATION_ADAPTIVE || C122_AIR_REGIME_SHADOW) {
+    if (C121_AIR_PROJECT_REALIZATION_REGIME < 0
+        && C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED
+            >= C121_AIR_PROJECT_REALIZATION_CLASSIFY_YEARS) {
+      local efficiency = pressured >= C121_AIR_PROJECT_REALIZATION_MIN_PRESSURED
+          && contestablePermille >= C121_AIR_PROJECT_REALIZATION_MIN_CONTESTABLE_PERMILLE
+          && openPermille >= 0
+          && openPermille <= C121_AIR_PROJECT_REALIZATION_MAX_OPEN_PERMILLE;
+      C121_AIR_PROJECT_REALIZATION_REGIME = efficiency ? 1 : 0;
+      /* Le regime agit sur l'admission au portefeuille, qui est recalculee
+       * lors de la publication, et non sur le choix moteur memoise. */
+      OpexDiagLog("C121_STRATEGY_LOCK source_year=" + C121_AIR_PRESSURE_PREV.year
+          + " observed_years=" + C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED
+          + " pressured=" + pressured + " contestable_permille=" + contestablePermille
+          + " open_permille=" + openPermille
+          + " regime=" + (efficiency ? "efficiency" : "race"));
+    } else {
+      local regimeName = C121_AIR_PROJECT_REALIZATION_REGIME < 0 ? "observe"
+          : (C121_AIR_PROJECT_REALIZATION_REGIME == 1 ? "efficiency" : "race");
+      OpexDiagLog("C121_STRATEGY source_year=" + C121_AIR_PRESSURE_PREV.year
+          + " observed_years=" + C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED
+          + " regime=" + regimeName + " locked="
+          + (C121_AIR_PROJECT_REALIZATION_REGIME >= 0 ? 1 : 0));
+    }
+  }
+  C121_AIR_PRESSURE_ACCUM = OpexC121PressureNewAccum(year);
+}
+
+/* Collecte C121 : accumule la pression concurrentielle uniquement sur les
+ * villes deja consultees par la selection via C83. Aucun scan de carte,
+ * aucune lecture API supplementaire du bruit/slot. Le cumul sert a la
+ * classification AIR et reste gere par OpexC121PressureAdvanceYear. */
+function OpexC121RecordPressureSnapshot(state)
+{
+  if ((!C121_AIR_PROJECT_REALIZATION_ADAPTIVE
+      && !C122_AIR_REGIME_SHADOW)
+      || state == null || !("slotRemaining" in state)) return;
+  OpexC121PressureAdvanceYear();
+  local open = 0;
+  local competitor = 0;
+  local locked = 0;
+  local other = 0;
+  foreach (townId, remaining in state.slotRemaining) {
+    if (remaining >= 2) open++;
+    else if (remaining == 1) competitor++;
+    else if (remaining == 0) locked++;
+    else other++;
+    if (!(townId in C121_AIR_PRESSURE_ACCUM.towns)) {
+      C121_AIR_PRESSURE_ACCUM.towns.rawset(townId, remaining);
+    } else if (remaining < C121_AIR_PRESSURE_ACCUM.towns[townId]) {
+      C121_AIR_PRESSURE_ACCUM.towns[townId] = remaining;
+    }
+  }
+  local observed = open + competitor + locked + other;
+  C121_AIR_PRESSURE_ACCUM.samples++;
+}
+
+/* C78 / course defensive : avec station_noise_level=0 (configuration du duel),
+ * OpenTTD implemente AITown.GetAllowedNoise() comme max(0, 2 - nombre d'aeroports)
+ * pour TOUTES les compagnies de cette ville. C'est donc directement le nombre de
+ * slots physiques restants : 2=libre, 1=un concurrent deja present, 0=verrouille.
+ * La ville est deja exclue plus haut si Opex y possede un aeroport. Un seul appel
+ * O(1) par ville et par passe remplace ainsi tout scan de carte. Sous la regle de
+ * bruit active, ce retour change de semantique ; avec le conseil permissif (=3),
+ * le plafond des deux aeroports est lui-meme desactive. Dans ces deux cas on ne
+ * declenche pas cette politique. */
+function OpexC78TownHasCompetitorAirport(townId, state)
+{
+  local remaining = OpexC83TownSlotsRemaining(townId, state);
+  if (remaining == 1 && C78_SLOT_INTERCEPT_PROBE) {
+    OpexC78SlotLog("phase=competitor_airport town=" + townId + " slots_remaining=1");
+  }
+  return remaining == 1;
+}
+
+function OpexProjectSetEarlySlotField(project, field, value)
+{
+  if (field in project) project[field] = value;
+  else project[field] <- value;
+}
+
+/* Classe uniquement les projets air DEJA rentables. Le town associe au slot est
+ * derive du site physique (meme convention que le diagnostic 771), ce qui evite
+ * de confondre la ville cible commerciale avec la ville qui porte reellement la
+ * limite des deux aeroports. Aucun champ economique n'est modifie. */
+function OpexProjectRefreshEarlySlot(project, state)
+{
+  if (project == null || state == null) return;
+
+  local physicalClaims = 0;
+  local bonusClaims = 0;
+  local claimPopulation = 0;
+  local townA = -1;
+  local townB = -1;
+  local popA = -1;
+  local popB = -1;
+
+  if (("mode" in project) && project.mode == "air" && ("payload" in project) && project.payload != null && state.servedCount < AIR_EARLY_SLOT_TARGET_TOWNS) {
+    local plan = project.payload;
+    local reuseA = ("reuseA" in plan) && plan.reuseA;
+    local reuseB = ("reuseB" in plan) && plan.reuseB;
+    local claimedTowns = {};
+
+    if (("siteA" in plan) && plan.siteA != null && ("town" in plan.siteA)) {
+      townA = AITile.GetClosestTown(plan.siteA.anchor);
+      if (townA < 0) townA = plan.siteA.town.id;
+      if (townA >= 0 && AITown.IsValidTown(townA)) popA = AITown.GetPopulation(townA);
+      if (!reuseA && popA >= AIR_EARLY_SLOT_MIN_POP
+          && !(townA in state.servedTowns) && !(townA in claimedTowns)) {
+        claimedTowns.rawset(townA, true);
+        physicalClaims++;
+        claimPopulation += popA;
+      }
+    }
+
+    if (("siteB" in plan) && plan.siteB != null && ("town" in plan.siteB)) {
+      townB = AITile.GetClosestTown(plan.siteB.anchor);
+      if (townB < 0) townB = plan.siteB.town.id;
+      if (townB >= 0 && AITown.IsValidTown(townB)) popB = AITown.GetPopulation(townB);
+      if (!reuseB && popB >= AIR_EARLY_SLOT_MIN_POP
+          && !(townB in state.servedTowns) && !(townB in claimedTowns)) {
+        claimedTowns.rawset(townB, true);
+        physicalClaims++;
+        claimPopulation += popB;
+      }
+    }
+
+    local remaining = AIR_EARLY_SLOT_TARGET_TOWNS - state.servedCount;
+    bonusClaims = physicalClaims;
+    if (bonusClaims > remaining) bonusClaims = remaining;
+  }
+
+  /* Les claims physiques decrivent ce que le chantier securisera reellement.
+   * Les bonus claims sont bornes par la cible et seuls eux pilotent la prime. */
+  OpexProjectSetEarlySlotField(project, "earlySlotClaims", physicalClaims);
+  OpexProjectSetEarlySlotField(project, "earlySlotBonusClaims", bonusClaims);
+  OpexProjectSetEarlySlotField(project, "earlySlotClaimPopulation", claimPopulation);
+  OpexProjectSetEarlySlotField(project, "earlySlotServedBefore", state.servedCount);
+  OpexProjectSetEarlySlotField(project, "earlySlotBonusPct", AIR_EARLY_SLOT_BONUS_PCT * bonusClaims);
+  OpexProjectSetEarlySlotField(project, "earlySlotTownA", townA);
+  OpexProjectSetEarlySlotField(project, "earlySlotTownB", townB);
+  OpexProjectSetEarlySlotField(project, "earlySlotPopA", popA);
+  OpexProjectSetEarlySlotField(project, "earlySlotPopB", popB);
+}
+
+/* C78 : annotation strictement separee d'early-slot. Ce helper n'est appele
+ * que sous C77, afin de ne pas ajouter de travail par candidat au chemin par
+ * defaut air_early_slot=1. */
+function OpexProjectRefreshDefensiveSlot(project, state)
+{
+  if (project == null || state == null) return;
+
+  local claims = 0;
+  local competitorClaims = 0;
+  local ownClaims = 0;
+  local newTownClaims = 0;
+  local observeNewTowns = C122_AIR_REGIME_SHADOW;
+  local townA = -1;
+  local townB = -1;
+  if (("mode" in project) && project.mode == "air"
+      && ("payload" in project) && project.payload != null) {
+    local plan = project.payload;
+    local reuseA = ("reuseA" in plan) && plan.reuseA;
+    local reuseB = ("reuseB" in plan) && plan.reuseB;
+    local ownSecondA = ("c83OwnSecondSlotA" in plan) && plan.c83OwnSecondSlotA;
+    local ownSecondB = ("c83OwnSecondSlotB" in plan) && plan.c83OwnSecondSlotB;
+    local claimedTowns = {};
+    local newTowns = observeNewTowns ? {} : null;
+
+    if (("siteA" in plan) && plan.siteA != null && ("town" in plan.siteA)) {
+      if (("anchor" in plan.siteA) && AIMap.IsValidTile(plan.siteA.anchor)) {
+        townA = AITile.GetClosestTown(plan.siteA.anchor);
+      }
+      if (townA < 0) townA = plan.siteA.town.id;
+      if (!reuseA && townA >= 0 && AITown.IsValidTown(townA)
+          && AITown.GetPopulation(townA) >= AIR_EARLY_SLOT_MIN_POP
+          && !(townA in claimedTowns)) {
+        if (observeNewTowns
+            && !(townA in state.servedTowns) && !(townA in newTowns)) {
+          newTowns.rawset(townA, true);
+          newTownClaims++;
+        }
+        if (ownSecondA && (townA in state.servedTowns)
+            && OpexC83TownSlotsRemaining(townA, state) == 1) {
+          claimedTowns.rawset(townA, true);
+          claims++;
+          ownClaims++;
+        } else if (!(townA in state.servedTowns)
+            && OpexC78TownHasCompetitorAirport(townA, state)) {
+          claimedTowns.rawset(townA, true);
+          claims++;
+          competitorClaims++;
+        }
+      }
+    }
+
+    if (("siteB" in plan) && plan.siteB != null && ("town" in plan.siteB)) {
+      if (("anchor" in plan.siteB) && AIMap.IsValidTile(plan.siteB.anchor)) {
+        townB = AITile.GetClosestTown(plan.siteB.anchor);
+      }
+      if (townB < 0) townB = plan.siteB.town.id;
+      if (!reuseB && townB >= 0 && AITown.IsValidTown(townB)
+          && AITown.GetPopulation(townB) >= AIR_EARLY_SLOT_MIN_POP
+          && !(townB in claimedTowns)) {
+        if (observeNewTowns
+            && !(townB in state.servedTowns) && !(townB in newTowns)) {
+          newTowns.rawset(townB, true);
+          newTownClaims++;
+        }
+        if (ownSecondB && (townB in state.servedTowns)
+            && OpexC83TownSlotsRemaining(townB, state) == 1) {
+          claimedTowns.rawset(townB, true);
+          claims++;
+          ownClaims++;
+        } else if (!(townB in state.servedTowns)
+            && OpexC78TownHasCompetitorAirport(townB, state)) {
+          claimedTowns.rawset(townB, true);
+          claims++;
+          competitorClaims++;
+        }
+      }
+    }
+
+  }
+
+  OpexProjectSetEarlySlotField(project, "defensiveSlotClaims", claims);
+  OpexProjectSetEarlySlotField(project, "defensiveCompetitorClaims", competitorClaims);
+  OpexProjectSetEarlySlotField(project, "defensiveOwnClaims", ownClaims);
+  if (observeNewTowns) {
+    OpexProjectSetEarlySlotField(project, "defensiveNewTownClaims", newTownClaims);
+  }
+  OpexProjectSetEarlySlotField(project, "defensiveSlotTownA", townA);
+  OpexProjectSetEarlySlotField(project, "defensiveSlotTownB", townB);
+}
+
+/* C78 / course defensive au second slot : sous C77, une grande ville ou un
+ * concurrent a deja un aeroport et ou Opex peut encore en poser un est une
+ * ressource perissable. Aucun champ economique n'est modifie : cette information
+ * sert seulement de classe lexicographique devant les projets ordinaires. */
+function OpexProjectDefensiveAirPriority(project)
+{
+  if (project == null) return 0;
+  if (!("mode" in project) || project.mode != "air") return 0;
+  if (!("profitAnnual" in project) || project.profitAnnual <= 0) return 0;
+  local competitorClaims = ("defensiveCompetitorClaims" in project)
+      ? project.defensiveCompetitorClaims : 0;
+  if (competitorClaims > 0) return 2;
+  local ownClaims = ("defensiveOwnClaims" in project) ? project.defensiveOwnClaims : 0;
+  if (ownClaims > 0) return 1;
+  return 0;
+}
+
+/* C122.2 : cle contrefactuelle conservee pour le shadow AIR par regime.
+ * Aucun ordre ni champ economique n'est modifie.
+ *
+ * C77 porte deja le vrai signal perissable de second slot concurrent et reste
+ * compare avant le shadow. En race, le diagnostic observe un signal distinct :
+ * une extremite neuve dans une ville que l'etat defensif deja calcule marque
+ * comme encore non servie par Opex. Cette annotation reste disponible apres la
+ * fenetre early-slot et ne demande aucun scan/appel API supplementaire. En
+ * observation / efficiency, l'ordre economique C121 reste brut. Aucun arm
+ * topologique n'est favorise en soi.
+ *
+ * L'appelant ne compare cette cle que pour AIR<->AIR ; elle ne promeut aucun
+ * projet, y compris devant rail/route/eau. */
+function OpexC122AirRegimeTier(project)
+{
+  if (C121_AIR_PROJECT_REALIZATION_REGIME != 0) return 0;
+  if (project == null || !("mode" in project) || project.mode != "air") return 0;
+  local newTownClaims = ("defensiveNewTownClaims" in project) ? project.defensiveNewTownClaims : 0;
+  if (newTownClaims > 0) return 1;
+  return 0;
+}
+
+function OpexC122TraceShadow(winner, project, prior, projectC77Tier, priorC77Tier,
+                             projectRegimeTier, priorRegimeTier, field)
+{
+  if (!C122_AIR_REGIME_SHADOW || field != "fundScore") return;
+  local projectArm = (("payload" in project) && project.payload != null
+      && ("arm" in project.payload)) ? project.payload.arm : "none";
+  local priorArm = (("payload" in prior) && prior.payload != null
+      && ("arm" in prior.payload)) ? prior.payload.arm : "none";
+  OpexDiagLog("C122_SHADOW regime=race reason=new_opex_slot_town winner=" + winner
+      + " project_arm=" + projectArm + " prior_arm=" + priorArm
+      + " c77_project=" + projectC77Tier + " c77_prior=" + priorC77Tier
+      + " c122_project=" + projectRegimeTier + " c122_prior=" + priorRegimeTier
+      + " project_new=" + (("defensiveNewTownClaims" in project) ? project.defensiveNewTownClaims : 0)
+      + " prior_new=" + (("defensiveNewTownClaims" in prior) ? prior.defensiveNewTownClaims : 0)
+      + " project_score=" + project[field] + " prior_score=" + prior[field]);
+}
+
+/* portfolio_v2 : la selection finale.
+ *
+ * Remplace le sac a dos 0/1 par " le meilleur projet financable ". Motif (S0 septies, trouvaille
+ * B) : `maxBatch = 1` dans main.nut -- UN SEUL projet est construit, puis tout le portefeuille est
+ * regenere. Tout le sac a dos etait donc jete sauf un item, et cet item avait ete admis par un
+ * empaquetage dont l'objectif etait le REVENU total. A 300 kGBP de budget, le solveur preferait
+ * {3 x 100 kGBP / rev 20k} = 60k a {1 x 280 kGBP / rev 55k} = 55k : le meilleur projet etait
+ * financable et n'etait jamais construit.
+ *
+ * Trois defauts tombent d'un coup :
+ *   - l'objectif passe du revenu au PROFIT (soupcons 2 et 3) ;
+ *   - la contrainte " deux projets ne partagent aucune extremite " disparait (soupcon 4) : elle
+ *     interdisait la topologie en etoile que builder_air produit, sans rien apporter puisqu'un
+ *     seul projet est bati ;
+ *   - le couple garde son alternative financable (soupcon 1), l'election modale se faisant
+ *     desormais APRES le test de capital.
+ *
+ * Le classement est le profit par livre de capital reellement mobilisable. */
+function OpexProjectFitFleetToBudget(project, capitalBudget)
+{
+  if (project == null || project.mode != "fleet") return project;
+  local entry = project.payload;
+  local line = entry.line;
+  if (line == null || (("scrapping" in line) && line.scrapping)) return null;
+  local have = ("vehCount" in line) ? line.vehCount : line.vehicles.len();
+  if (("baseVehicles" in entry) && have != entry.baseVehicles) return null;
+  local purchaseBudget = capitalBudget - 1000; // tampon d'OpexAirAddPlane
+  if ((ESTIM_UNIFIE & 2) != 0) purchaseBudget = capitalBudget;
+  if (entry.planePrice <= 0 || entry.want <= 0 || purchaseBudget < entry.planePrice) return null;
+  local quantity = (purchaseBudget / entry.planePrice).tointeger();
+  if (quantity >= entry.want) return project;
+
+  /* Une seule tranche par demande, jamais des +1 concurrents pour la meme ligne.
+   * Ne pas modifier le vivier : une reelection avec davantage de capital doit
+   * encore voir la demande complete. R2 : conserver la provenance du profit. */
+  local fitted = clone project;
+  local reduced = clone entry;
+  reduced.want = quantity;
+  fitted.payload = reduced;
+  fitted.capital = quantity * entry.planePrice;
+  fitted.budgetCapital = fitted.capital + 1000;
+  if ((ESTIM_UNIFIE & 2) != 0) fitted.budgetCapital = fitted.capital;
+  if ((ESTIM_UNIFIE & 4) != 0 && ("deltaR" in project)) {
+    fitted.deltaR = (project.deltaR / entry.want) * quantity;
+    fitted.deltaE = (project.deltaE / entry.want) * quantity;
+    fitted.deltaA = (project.deltaA / entry.want) * quantity;
+    fitted.deltaC = fitted.capital;
+    fitted.deltaP = fitted.deltaR - fitted.deltaE - fitted.deltaA;
+  }
+  fitted.profitAnnual = (project.profitAnnual / entry.want) * quantity;
+  fitted.revenueAnnual = (project.revenueAnnual / entry.want) * quantity;
+  if (fitted.profitAnnual <= 0) return null;
+  fitted.roi = (fitted.profitAnnual * 1000) / fitted.capital;
+  fitted.budgetScore = OpexProjectScore(fitted.revenueAnnual, fitted.budgetCapital);
+  fitted.opcodeScore = OpexProjectScore(fitted.revenueAnnual, fitted.expectedOpcodes);
+  return fitted;
+}
+
+/* C121 split : le plancher absolu continue de lire project.profitAnnual, qui
+ * represente la valeur long terme max-profit. Seul le classement fundScore peut
+ * consommer la profondeur portfolio. La calibration C70/C82 est multiplicative
+ * pour un meme projet/moteur : appliquer au profit portfolio le meme facteur que
+ * celui mesure sur le profit long terme preserve exactement ce calibrage. */
+function OpexProjectFundProfit(project)
+{
+  local calibMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+  local calibrated = OpexCalibratedProfit(project);
+  if (calibMark != null) OpexSpanAgg("pub.select.calibrate", calibMark);
+  return calibrated;
+}
+
+function OpexSelectRejectScore(project, kDec)
+{
+  if (project == null) return 0;
+  if ("fundScore" in project) return project.fundScore;
+  local financeCapital = OpexProjectFinanceCapital(project);
+  local decisionFinanceCapital = financeCapital;
+  if (("decisionFinanceCapital" in project) && project.decisionFinanceCapital > 0) {
+    decisionFinanceCapital = project.decisionFinanceCapital;
+  }
+  local denom = (kDec > decisionFinanceCapital) ? kDec : decisionFinanceCapital;
+  return OpexProjectScore(OpexProjectFundProfit(project), denom);
+}
+
+function OpexSelectRejectLog(project, reason, affordable, scoreKey, kDec)
+{
+  if (!PROBE_SELECT_REJECT || project == null) return;
+  if (!("mode" in project) || project.mode != "air") return;
+
+  local typeStr = "newpair";
+  if (("payload" in project) && project.payload != null && ("arm" in project.payload)) {
+    typeStr = project.payload.arm;
+  }
+
+  local score = OpexSelectRejectScore(project, kDec);
+  local topScore = 0;
+  local rank = affordable.len();
+  if (affordable.len() > 0) {
+    local topProj = affordable[0];
+    topScore = (scoreKey in topProj) ? topProj[scoreKey] : (("fundScore" in topProj) ? topProj.fundScore : topProj.budgetScore);
+    for (local i = 0; i < affordable.len(); i++) {
+      local p = affordable[i];
+      local pScore = (scoreKey in p) ? p[scoreKey] : (("fundScore" in p) ? p.fundScore : p.budgetScore);
+      if (score > pScore) {
+        rank = i;
+        break;
+      }
+    }
+  }
+
+  local pairStr = project.src + "|" + project.dst;
+  OpexDecide("SELECT_REJECT", "pair=" + pairStr + " type=" + typeStr + " reason=" + reason + " rank=" + rank + " score=" + score + " top=" + topScore);
+}
+
+function OpexSelectRejectLogTopK(dropped, best, limit)
+{
+  if (!PROBE_SELECT_REJECT || dropped == null) return;
+  if (!("mode" in dropped) || dropped.mode != "air") return;
+
+  local typeStr = "newpair";
+  if (("payload" in dropped) && dropped.payload != null && ("arm" in dropped.payload)) {
+    typeStr = dropped.payload.arm;
+  }
+
+  local score = ("fundScore" in dropped) ? dropped.fundScore : (("budgetScore" in dropped) ? dropped.budgetScore : 0);
+  local topScore = 0;
+  if (best.len() > 0) {
+    local topProj = best[0];
+    topScore = ("fundScore" in topProj) ? topProj.fundScore : topProj.budgetScore;
+  }
+
+  local pairStr = dropped.src + "|" + dropped.dst;
+  OpexDecide("SELECT_REJECT", "pair=" + pairStr + " type=" + typeStr + " reason=topk rank=" + limit + " score=" + score + " top=" + topScore);
+}
+
+/* P2 : quote economique du trace deja termine. Le devis de commandes exact
+ * (OpexQuoteRailCapital) n'est disponible qu'a l'execution : aucun test-mode
+ * ni commande de construction ne doit etre lance pendant le classement. */
+function OpexP2PreparedRailQuote(project, capitalBudget, abandonedPairs)
+{
+  if (project == null || !("mode" in project) || project.mode != "rail"
+      || !("payload" in project) || project.payload == null
+      || !("cargo" in project) || !AICargo.IsValidCargo(project.cargo)
+      || !("economicsDate" in project)
+      || project.economicsDate != AIDate.GetCurrentDate()
+      || !("profitAnnual" in project) || project.profitAnnual <= 0
+      || !("capital" in project) || project.capital <= 0
+      || OpexCandidateIsAbandoned(project, abandonedPairs)) return 0;
+  local payload = project.payload;
+  if (!("railPlan" in payload) || payload.railPlan == null) return 0;
+  local plan = payload.railPlan;
+  if (!("ok" in plan) || plan.ok != true
+      || !("planA" in plan) || plan.planA == null
+      || !("planB" in plan) || plan.planB == null
+      || !("tiles" in plan) || plan.tiles == null || plan.tiles.len() < 2
+      || !("capital" in plan) || plan.capital <= 0
+      || !("capital" in payload) || payload.capital != plan.capital
+      || project.capital != plan.capital) return 0;
+  local finance = OpexProjectFinanceCapital(project);
+  if (finance <= 0 || finance > capitalBudget) return 0;
+  return plan.capital;
+}
+
+/* L'adversaire est strictement une nouvelle ligne rail PASS/MAIL deja tracee,
+ * ou AIR avec devis economique de la date. Flottes/V252, ROAD et WATER exclus. */
+function OpexP2OpportunityRival(project, capitalBudget, abandonedPairs)
+{
+  if (project == null || !("mode" in project) || !("profitAnnual" in project)
+      || project.profitAnnual <= 0 || !("fundScore" in project)
+      || project.fundScore <= 0) return false;
+  local finance = OpexProjectFinanceCapital(project);
+  if (finance <= 0 || finance > capitalBudget) return false;
+  if (project.mode == "rail") {
+    if (!("cargo" in project) || !AICargo.IsValidCargo(project.cargo)
+        || !(AICargo.HasCargoClass(project.cargo, AICargo.CC_PASSENGERS)
+            || AICargo.HasCargoClass(project.cargo, AICargo.CC_MAIL)))
+      return false;
+    return OpexP2PreparedRailQuote(project, capitalBudget, abandonedPairs) > 0;
+  }
+  if (project.mode != "air" || !("payload" in project)
+      || project.payload == null || !("economicsDate" in project)
+      || project.economicsDate != AIDate.GetCurrentDate()
+      || OpexCandidateIsAbandoned(project, abandonedPairs)) return false;
+  local plan = project.payload;
+  if (!("economics" in plan) || plan.economics == null
+      || !("decisionEconomics" in plan) || plan.decisionEconomics == null
+      || !("capital" in plan.economics) || plan.economics.capital <= 0
+      || !("capital" in plan.decisionEconomics) || plan.decisionEconomics.capital <= 0
+      || !("profitAnnual" in plan.decisionEconomics)
+      || plan.decisionEconomics.profitAnnual != project.profitAnnual
+      || !("decisionConstructionCapital" in project)
+      || project.decisionConstructionCapital != plan.decisionEconomics.capital
+      || !("decisionFinanceCapital" in project)
+      || project.decisionFinanceCapital <= 0) return false;
+  return true;
+}
+
+/* Le top-K a DEJA ete finance individuellement et trie par C77, score, revenu.
+ * Une seule permutation adjacente, strictement gagnante apres +8 %; aucune
+ * mutation du score, du plan, de _bs* ou des alternatives en mode 1. */
+function OpexP2OpportunityTopK(affordable, capitalBudget, abandonedPairs, mode)
+{
+  local mark = OpexOpsMeasureBegin();
+  /* Seulement ON : chaque election rend les anciennes traces inexploitables.
+   * Ne rien annoter en SHADOW et ne rien sauvegarder au Load. */
+  if (mode == 2) P2_OPPORTUNITY_STAMP++;
+  local chosenIndex = -1;
+  local chosenQuote = 0;
+  local chosenScore = 0.0;
+  local chosenRivalScore = 0.0;
+  for (local i = 1; i < affordable.len(); i++) {
+    local freight = affordable[i];
+    if (freight == null || !("kind" in freight) || freight.kind != "freight"
+        || !("cargo" in freight) || !AICargo.IsValidCargo(freight.cargo)
+        || AICargo.HasCargoClass(freight.cargo, AICargo.CC_PASSENGERS)
+        || AICargo.HasCargoClass(freight.cargo, AICargo.CC_MAIL)
+        || !("fundScore" in freight) || freight.fundScore <= 0) continue;
+    local quote = OpexP2PreparedRailQuote(freight, capitalBudget, abandonedPairs);
+    if (quote <= 0) continue;
+    local rival = affordable[i - 1];
+    if (!OpexP2OpportunityRival(rival, capitalBudget, abandonedPairs)
+        || OpexProjectDefensiveAirPriority(rival) != OpexProjectDefensiveAirPriority(freight))
+      continue;
+    local freightScore = OpexProjectSelectionScore(freight, "fundScore");
+    local rivalScore = OpexProjectSelectionScore(rival, "fundScore");
+    if (freight.fundScore < rival.fundScore * 0.93
+        || freight.profitAnnual < rival.profitAnnual * 0.80
+        || freightScore > rivalScore || freightScore * 1.08 <= rivalScore)
+      continue;
+    if (chosenIndex < 0 || freightScore > chosenScore) {
+      chosenIndex = i;
+      chosenQuote = quote;
+      chosenScore = freightScore;
+      chosenRivalScore = rivalScore;
+    }
+  }
+  /* La mesure inclut le scan; retirer tout changement si le cout supplementaire
+   * depasse 50 000 opcodes. Aucun etat n'est conserve entre deux selections. */
+  local spent = OpexOpsMeasureEnd(mark);
+  local applied = false;
+  if (chosenIndex >= 0 && mode == 2 && spent < 50000) {
+    local prior = affordable[chosenIndex - 1];
+    affordable[chosenIndex - 1] = affordable[chosenIndex];
+    affordable[chosenIndex] = prior;
+    spent = OpexOpsMeasureEnd(mark);
+    if (spent <= 50000) {
+      applied = true;
+      local promoted = affordable[chosenIndex - 1];
+      if (("payload" in promoted) && promoted.payload != null) {
+        promoted.payload.rawset("p2OpportunityKey", OpexProjectAttemptKey(promoted) + "|" + chosenQuote);
+        promoted.payload.rawset("p2OpportunityStamp", P2_OPPORTUNITY_STAMP);
+      }
+    } else {
+      affordable[chosenIndex] = affordable[chosenIndex - 1];
+      affordable[chosenIndex - 1] = prior;
+    }
+  }
+  /* Le smoke 1x1 a expose 184 logs `none` sans promotion : l'instrumentation
+   * perturbait les trajectoires alors qu'aucune opportunite n'existait.
+   * Ne tracer que les conflits prouvables ou leur refus d'opcodes. */
+  if (DECISION_LOG && chosenIndex >= 0) {
+    if (mode == 2 && !applied && spent >= 50000) {
+      OpexDecide("P2_OPPORTUNITY", "action=ops_reject"
+          + " mode=" + mode + " topk=" + affordable.len() + " ops=" + spent
+          + " budget=" + capitalBudget);
+    } else {
+      local freight = affordable[applied ? chosenIndex - 1 : chosenIndex];
+      local rival = affordable[applied ? chosenIndex : chosenIndex - 1];
+      local key = OpexProjectAttemptKey(freight) + "|" + chosenQuote;
+      OpexDecide("P2_OPPORTUNITY", "action=" + (applied ? "promote" : "shadow")
+          + " mode=" + mode + " key=" + key
+          + " rank_before=" + chosenIndex + " rank_after=" + (applied ? chosenIndex - 1 : chosenIndex)
+          + " rival=" + OpexProjectAttemptKey(rival)
+          + " cargo=" + AICargo.GetCargoLabel(freight.cargo)
+          + " src=" + freight.src + " dst=" + freight.dst + " quote=" + chosenQuote
+          + " finance=" + OpexProjectFinanceCapital(freight)
+          + " rival_finance=" + OpexProjectFinanceCapital(rival)
+          + " budget=" + capitalBudget + " tier=" + OpexProjectDefensiveAirPriority(freight)
+          + " fund=" + freight.fundScore + " rival_fund=" + rival.fundScore
+          + " rank_score=" + chosenScore + " rival_rank_score=" + chosenRivalScore
+          + " boosted_score=" + chosenScore * 1.08
+          + " profit=" + freight.profitAnnual + " rival_profit=" + rival.profitAnnual
+          + " ops=" + spent);
+    }
+  }
+}
+
+/* MULTI-1 : ne considerer que les ROUTES deja financables dans le TOP-K final.
+ * Le classement initial et les tiers C77 sont calcules avant cet appel ;
+ * aucune generation, devis ou API concurrente. OFF ne l'appelle jamais. */
+function OpexMulti1RoadPromote(affordable, capitalBudget, level)
+{
+  if (affordable == null || affordable.len() < 2 || !MODE_AIR || !MODE_RAIL || !MODE_ROAD) return;
+  local year = AIDate.GetYear(AIDate.GetCurrentDate());
+  if (year < 1971 || year > 1973) return;
+  local head = affordable[0];
+  if (head == null || head.mode == "road" || head.profitAnnual <= 0
+      || !("fundScore" in head) || head.fundScore <= 0
+      || OpexProjectDefensiveAirPriority(head) != 0) return;
+  local limit = affordable.len() < 8 ? affordable.len() : 8;
+  for (local i = 1; i < limit; i++) {
+    local road = affordable[i];
+    if (road == null || road.mode != "road" || road.profitAnnual <= 0
+        || !("fundScore" in road) || road.fundScore < 0.85 * head.fundScore
+        || road.profitAnnual < 0.60 * head.profitAnnual
+        || OpexProjectFinanceCapital(road) > capitalBudget) continue;
+    OpexDiagLog("MULTI1_ROAD_PRIORITY year=" + year
+        + " action=" + (level == 2 ? "promote" : "shadow") + " rank=" + i
+        + " head_mode=" + head.mode + " head_score=" + head.fundScore
+        + " head_profit=" + head.profitAnnual + " head_capital=" + OpexProjectFinanceCapital(head)
+        + " road_score=" + road.fundScore + " road_profit=" + road.profitAnnual
+        + " road_capital=" + OpexProjectFinanceCapital(road));
+    if (level == 2) {
+      affordable.remove(i);
+      affordable.insert(0, road);
+    }
+    return;
+  }
+}
+
+/* MULTI-1 second experiment: defer an unprepared RAIL search only for an
+ * already funded AIR alternative of comparable profit and score. The C77
+ * defensive tier has already been computed and must not be bypassed. */
+function OpexMulti1AirOverRail(affordable, capitalBudget, level)
+{
+  if (affordable == null || affordable.len() < 2 || !MODE_AIR || !MODE_RAIL || !MODE_ROAD) return;
+  local date = AIDate.GetCurrentDate();
+  local year = AIDate.GetYear(date);
+  if (year < 1971 || year > 1973) return;
+  local head = affordable[0];
+  if (head == null || head.mode != "rail" || head.profitAnnual <= 0
+      || !("fundScore" in head) || head.fundScore <= 0
+      || OpexProjectDefensiveAirPriority(head) != 0) return;
+  if (("payload" in head) && head.payload != null
+      && ("railPlan" in head.payload) && head.payload.railPlan != null) return;
+  local limit = affordable.len() < 8 ? affordable.len() : 8;
+  for (local i = 1; i < limit; i++) {
+    local air = affordable[i];
+    if (air == null || air.mode != "air" || air.profitAnnual <= 0
+        || !("fundScore" in air) || air.fundScore < 0.80 * head.fundScore
+        || air.profitAnnual < 0.70 * head.profitAnnual
+        || OpexProjectDefensiveAirPriority(air) != 0
+        || OpexProjectFinanceCapital(air) > capitalBudget) continue;
+    if (!("payload" in air) || air.payload == null
+        || !("siteA" in air.payload) || !("siteB" in air.payload)
+        || air.payload.siteA == null || air.payload.siteB == null
+        || !("town" in air.payload.siteA) || !("town" in air.payload.siteB)
+        || air.payload.siteA.town == null || air.payload.siteB.town == null
+        || !("tile" in air.payload.siteA.town)
+        || !("tile" in air.payload.siteB.town)) continue;
+    OpexDiagLog("MULTI1_AIR_OVER_RAIL year=" + year
+        + " date=" + year + "-" + AIDate.GetMonth(date) + "-" + AIDate.GetDayOfMonth(date)
+        + " action=" + (level == 2 ? "promote" : "shadow") + " rank=" + i
+        + " src=" + air.payload.siteA.town.tile + " dst=" + air.payload.siteB.town.tile
+        + " air_score=" + air.fundScore + " air_profit=" + air.profitAnnual
+        + " air_capital=" + OpexProjectFinanceCapital(air)
+        + " rail_score=" + head.fundScore + " rail_profit=" + head.profitAnnual
+        + " rail_capital=" + OpexProjectFinanceCapital(head));
+    if (level == 2) {
+      affordable.remove(i);
+      affordable.insert(0, air);
+    }
+    return;
+  }
+}
+
+/* ROAD1Y freight : admission explicite et bornee du fret routier dans le
+ * vivier de selection (limit = PROJECT_TOP_K). Remplace le doublement des
+ * profits/ratios fret (biais d'admission qui faussait aussi classement et
+ * ROI). `pool` tient les meilleurs projets fret routiers financables, classes
+ * ENTRE EUX par le meme comparateur que le vivier (fundScore reel), au plus
+ * limit / 4. Si le vivier en contient moins de limit / 4, les manquants
+ * prennent une place libre ou celle des derniers projets non fret, puis sont
+ * inseres a leur rang reel. Aucune valeur economique n'est modifiee.
+ * Appele seulement si ROAD1Y_FREIGHT > 0 ; modifie le vivier `best` en place. */
+function OpexRoad1yFreightPoolAdmit(best, pool, field, limit, realSelection)
+{
+  local quota = limit / 4;
+  local freightIn = 0;
+  foreach (p in best) {
+    if (p.mode == "road" && ("kind" in p) && p.kind == "freight") freightIn++;
+  }
+  local missing = [];
+  foreach (p in pool) {
+    local present = false;
+    foreach (q in best) {
+      if (q == p) {
+        present = true;
+        break;
+      }
+    }
+    if (!present) missing.append(p);
+  }
+  local admit = quota - freightIn;
+  if (admit > missing.len()) admit = missing.len();
+  if (admit <= 0) return;
+  local evict = admit - (limit - best.len());
+  local evicted = 0;
+  for (local i = best.len() - 1; i >= 0 && evicted < evict; i--) {
+    local p = best[i];
+    if (p.mode == "road" && ("kind" in p) && p.kind == "freight") continue;
+    best.remove(i);
+    evicted++;
+  }
+  local added = 0;
+  foreach (p in missing) {
+    if (added >= admit || best.len() >= limit) break;
+    OpexProjectInsertDefensive(best, p, field, limit, true);
+    added++;
+  }
+  if (DECISION_LOG && realSelection)
+    OpexDecide("ROAD1Y_FREIGHT_POOL", "limit=" + limit + " quota=" + quota
+        + " freight_in=" + freightIn + " pool=" + pool.len() + " admitted=" + added
+        + " evicted=" + evicted + " size=" + best.len());
+}
+
+function OpexProjectSelectAffordable(alternatives, capitalBudget, limit, realSelection = true, abandonedPairs = null)
+{
+  SELECT_BISECT_STAMP++;
+  local spSelect = PROBE_SPAN_TRACE ? OpexSpanBegin("select.full") : null;
+  /* R1 : dimensionnement AVANT plancher, sondes et classement commun a tous
+   * les modes. Le budget fourni represente la caisse mobilisable. */
+  local fittedAlternatives = [];
+  foreach (project in alternatives) {
+    /* Final selection fence: a cached C121/PO01C rail pax project may have
+     * been produced before the opt-in filter. Never fund its construction. */
+    if (PAX_AIR_FIRST_RAIL_OFF && project != null
+        && project.mode == "rail" && project.kind == "pax") continue;
+    if (PAX_AIR_FIRST_FEEDER_ONLY && project != null
+        && project.mode == "road" && project.kind == "pax") continue;
+    local fitMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+    local fitted = OpexProjectFitFleetToBudget(project, capitalBudget);
+    if (R1_R3_TEST_ONLY) fitted = OpexR1R3FitTrace(project, fitted, capitalBudget);
+    if (fitted != null) fittedAlternatives.append(fitted);
+    if (fitMark != null) OpexSpanAgg("pub.select.score.fit", fitMark);
+  }
+  alternatives = fittedAlternatives;
+  local spStates = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.score.states") : null;
+  /* Avant plancher et filtre. */
+  /* [!] LE PLANCHER DE PROFIT ABSOLU, ET POURQUOI IL EXISTE (banc du 2026-09-02,
+   * results/bench_isolation_3y_20seeds.json). Le tri au seul RATIO profit/capital a ete mesure isole :
+   * il fait bien ce qu'on lui demandait sur le volume -- 21,4 -> 27,2 gares, +27 %, le SEUL des
+   * quatre reglages a le bouger -- mais il coute -24,4 % de valeur et -30,7 % de profit annuel.
+   *
+   * Mecanisme : un ratio favorise les tout petits projets bon marche, dont le profit absolu est
+   * negligeable. Comme main.nut n'en batit qu'UN par cycle (maxBatch = 1), chaque cycle est alors
+   * consomme par une ligne mediocre, et les gros projets rentables ne sont jamais atteints. C'est
+   * exactement le risque " cheap-first " que l'analyse avait nomme d'avance.
+   *
+   * Le correctif garde le ratio -- c'est lui qui apporte le volume -- mais n'admet au classement
+   * que les projets dont le profit annuel atteint une fraction du MEILLEUR profit financable du
+   * moment. Le plancher est relatif, donc il ne depend ni de l'epoque, ni de la taille de la carte,
+   * ni de l'inflation : a 0 il reproduit exactement le comportement mesure ci-dessus. */
+  local floorProfit = 0;
+
+  local affordable = [];
+  local earlySlotState = OpexEarlySlotSelectionState();
+  local defensiveSlotState = OpexDefensiveSlotSelectionState(earlySlotState);
+  local scoreKey = "fundScore";
+
+  local kDec = 0;
+  local kDecData = null;
+  local c69Affordable = null;
+  {
+    kDecData = OpexC69ComputeKDec();
+    kDec = kDecData.K_dec;
+    /* AIR-FLOTTE-1 : le K_dec exact n'est normalement pas conserve hors
+     * sonde C69. En shadow seulement, retenir la derniere vraie selection. */
+    if (AIR_FLOTTE1_SHADOW && realSelection) {
+      ::AIR_FLOTTE1_KDEC = kDec;
+      ::AIR_FLOTTE1_KDEC_TICK = AIController.GetTick();
+    }
+    if (V216_PROBE && realSelection) V216_LAST_KDEC = kDec;
+    if (C69_BOTTLENECK_PROBE) c69Affordable = [];
+  }
+  if (spStates != null) OpexSpanEnd(spStates);
+
+  local road1yFreightPool = ROAD1Y_FREIGHT > 0 ? [] : null;
+  foreach (project in alternatives) {
+    local fundMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+    local slotMark = null;
+    local insertMark = null;
+    local financeCapital = OpexProjectFinanceCapital(project);
+
+    if (fundMark != null) {
+      OpexSpanAgg("pub.select.score.fund_score", fundMark);
+      fundMark = null;
+    }
+    if (financeCapital > capitalBudget) {
+      if (PROBE_SELECT_REJECT && project.mode == "air") {
+        OpexSelectRejectLog(project, "cash", affordable, scoreKey, kDec);
+      }
+      continue;
+    }
+    if (project.profitAnnual < floorProfit) {
+      if (PROBE_SELECT_REJECT && project.mode == "air") {
+        OpexSelectRejectLog(project, "floor", affordable, scoreKey, kDec);
+      }
+      continue;
+    }
+    slotMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+    OpexProjectRefreshEarlySlot(project, earlySlotState);
+    OpexProjectRefreshDefensiveSlot(project, defensiveSlotState);
+    if (slotMark != null) {
+      OpexSpanAgg("pub.select.score.refresh_slots", slotMark);
+      slotMark = null;
+    }
+    fundMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+    local decisionFinanceCapital = financeCapital;
+    if (project.mode == "air" && ("decisionFinanceCapital" in project)
+        && project.decisionFinanceCapital > 0)
+      decisionFinanceCapital = project.decisionFinanceCapital;
+    local scoreDecisionFinanceCapital = decisionFinanceCapital;
+    if ((ESTIM_UNIFIE & 16) != 0)
+      scoreDecisionFinanceCapital = OpexEstimRailScoreCapital(project, scoreDecisionFinanceCapital);
+    /* C121 : un renfort d'avion est un vrai projet economique concurrent d'une
+     * nouvelle ligne. L'exemption historique C69 lui donnerait un denominateur
+     * ~= prix avion alors que les lignes AIR sont bornees par K_dec, ce qui
+     * surclasse artificiellement les +1 avion. Conserver l'exemption pour le
+     * chemin legacy, mais pas pour une flotte portant une marge C121. */
+    local fleetExemptDecision = project.mode == "fleet"
+        && !OpexC121ProjectHasRealization(project)
+        && !(("v161NetMarginalModeled" in project) && project.v161NetMarginalModeled);
+    project.fundScore <- OpexProjectScore(OpexProjectFundProfit(project),
+        (kDec > scoreDecisionFinanceCapital && !fleetExemptDecision)
+            ? kDec : scoreDecisionFinanceCapital);
+    if (DECISION_LOG && (ESTIM_UNIFIE & 16) != 0 && project.mode == "rail"
+        && ESTIM16_RAIL_SCORE_TRACES < 32) {
+      ESTIM16_RAIL_SCORE_TRACES++;
+      OpexDecide("ESTIM16_RAIL_SCORE", "dist=" + project.distance
+          + " capital=" + project.capital + " finance=" + financeCapital
+          + " score_capital=" + scoreDecisionFinanceCapital
+          + " actual=" + ((("capitalIsActual" in project) && project.capitalIsActual) ? 1 : 0)
+          + " kR=" + OpexEstimRailRevenueFactor(project.distance)
+          + " score=" + project.fundScore);
+    }
+    if (project.mode == "air" && ("payload" in project) && project.payload != null && ("c121CatalogKey" in project.payload) && project.payload.c121CatalogKey in C121_CATALOG_CACHE)
+      C121_CATALOG_CACHE[project.payload.c121CatalogKey].lastScore = project.fundScore;
+    if (fundMark != null) {
+      OpexSpanAgg("pub.select.score.fund_score", fundMark);
+      fundMark = null;
+    }
+    insertMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+    if (C69_BOTTLENECK_PROBE) {
+      local denom = financeCapital > kDec ? financeCapital : kDec;
+      project.c69Score <- OpexProjectScore(OpexCalibratedProfit(project), denom);
+      OpexProjectInsertDefensive(c69Affordable, project, "c69Score", limit, true);
+    }
+    OpexProjectInsertDefensive(affordable, project, scoreKey, limit, true);
+    if (road1yFreightPool != null && project.mode == "road"
+        && ("kind" in project) && project.kind == "freight")
+      OpexProjectInsertDefensive(road1yFreightPool, project, scoreKey, limit / 4, true);
+    if (insertMark != null) {
+      OpexSpanAgg("pub.select.score.insert", insertMark);
+      insertMark = null;
+    }
+  }
+  /* Filet de securite : si le plancher a tout ecarte -- il ne le peut pas puisque le meilleur
+   * projet l'atteint par construction, mais un profitAnnual nul ou negatif rendrait bestProfit nul
+   * et le plancher inoperant -- on retombe sur l'ensemble financable brut plutot que de ne rien
+   * batir du tout. */
+  if (affordable.len() == 0 && floorProfit > 0) {
+    SELECT_BISECT_STAMP++;
+    if (C69_BOTTLENECK_PROBE) c69Affordable = [];
+    foreach (project in alternatives) {
+      local fundMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+      local slotMark = null;
+      local insertMark = null;
+      local financeCapital = OpexProjectFinanceCapital(project);
+      if (fundMark != null) {
+        OpexSpanAgg("pub.select.score.fund_score", fundMark);
+        fundMark = null;
+      }
+      if (financeCapital > capitalBudget) continue;
+      slotMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+      OpexProjectRefreshEarlySlot(project, earlySlotState);
+      OpexProjectRefreshDefensiveSlot(project, defensiveSlotState);
+      if (slotMark != null) {
+        OpexSpanAgg("pub.select.score.refresh_slots", slotMark);
+        slotMark = null;
+      }
+      fundMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+      local decisionFinanceCapital = financeCapital;
+      if (project.mode == "air" && ("decisionFinanceCapital" in project)
+          && project.decisionFinanceCapital > 0)
+        decisionFinanceCapital = project.decisionFinanceCapital;
+      local scoreDecisionFinanceCapital = decisionFinanceCapital;
+      if ((ESTIM_UNIFIE & 16) != 0)
+        scoreDecisionFinanceCapital = OpexEstimRailScoreCapital(project, scoreDecisionFinanceCapital);
+      local fleetExemptDecision = project.mode == "fleet"
+          && !OpexC121ProjectHasRealization(project)
+          && !(("v161NetMarginalModeled" in project) && project.v161NetMarginalModeled);
+      project.fundScore <- OpexProjectScore(OpexProjectFundProfit(project),
+          (kDec > scoreDecisionFinanceCapital && !fleetExemptDecision)
+              ? kDec : scoreDecisionFinanceCapital);
+      if (fundMark != null) {
+        OpexSpanAgg("pub.select.score.fund_score", fundMark);
+        fundMark = null;
+      }
+      insertMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+      if (C69_BOTTLENECK_PROBE) {
+        local denom = financeCapital > kDec ? financeCapital : kDec;
+        project.c69Score <- OpexProjectScore(OpexCalibratedProfit(project), denom);
+        OpexProjectInsertDefensive(c69Affordable, project, "c69Score", limit, true);
+      }
+      OpexProjectInsertDefensive(affordable, project, scoreKey, limit, true);
+      if (insertMark != null) {
+        OpexSpanAgg("pub.select.score.insert", insertMark);
+        insertMark = null;
+      }
+    }
+  }
+  if (road1yFreightPool != null)
+    OpexRoad1yFreightPoolAdmit(affordable, road1yFreightPool, scoreKey, limit, realSelection);
+  local spEpilogue = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.score.epilogue") : null;
+
+  if (C69_BOTTLENECK_PROBE) {
+    ::C69_LAST_AFFORDABLE = c69Affordable;
+    ::C69_LAST_KDEC_DATA = kDecData;
+    local toSel = { rail = 0, road = 0, air = 0, water = 0, fleet = 0 };
+    local aff = { rail = 0, road = 0, air = 0, water = 0, fleet = 0 };
+    local sel = { rail = 0, road = 0, air = 0, water = 0, fleet = 0 };
+    foreach (p in alternatives) {
+      local m = ("mode" in p) ? p.mode : "unknown";
+      if (m in toSel) toSel[m]++;
+      local fc = OpexProjectFinanceCapital(p);
+      if (fc <= capitalBudget && (floorProfit <= 0 || p.profitAnnual >= floorProfit)) {
+        if (m in aff) aff[m]++;
+      }
+    }
+    foreach (p in affordable) {
+      local m = ("mode" in p) ? p.mode : "unknown";
+      if (m in sel) sel[m]++;
+    }
+    OpexC73RecordSelection(toSel, aff, sel);
+  }
+
+  OpexC121RecordPressureSnapshot(defensiveSlotState);
+  if (R1_R3_TEST_ONLY) {
+    foreach (project in alternatives) {
+      if (!("r1r3Id" in project)) continue;
+      local rank = -1;
+      for (local k = 0; k < affordable.len(); k++) {
+        if (affordable[k] == project) { rank = k; break; }
+      }
+      OpexR1R3Log("mechanism=R1 phase=rank id=" + project.r1r3Id
+          + " rank=" + rank + " score=" + (("fundScore" in project) ? project.fundScore : "unknown")
+          + " finance=" + OpexProjectFinanceCapital(project) + " budget=" + capitalBudget);
+    }
+  }
+  if (DECISION_LOG && realSelection && FRONT_PAX2_BOUNDED_OVERLAP == 2) {
+    for (local fp2Rank = 0; fp2Rank < affordable.len(); fp2Rank++) {
+      local fp2Project = affordable[fp2Rank];
+      if (fp2Project.mode != "air" || !("payload" in fp2Project)
+          || fp2Project.payload == null || !("frontPax2Id" in fp2Project.payload)) continue;
+      OpexDecide("FRONT_PAX2_TOPK", "id=" + fp2Project.payload.frontPax2Id
+          + " rank=" + fp2Rank + " profit=" + fp2Project.profitAnnual
+          + " finance=" + OpexProjectFinanceCapital(fp2Project)
+          + " budget=" + capitalBudget + " kdec=" + kDec);
+    }
+  }
+  if (realSelection && P2_RAIL_CARGO_OPPORTUNITY_RANK > 0)
+    OpexP2OpportunityTopK(affordable, capitalBudget, abandonedPairs, P2_RAIL_CARGO_OPPORTUNITY_RANK);
+  if (realSelection && MULTI1_ROAD_PRIORITY > 0)
+    OpexMulti1RoadPromote(affordable, capitalBudget, MULTI1_ROAD_PRIORITY);
+  if (realSelection && MULTI1_AIR_OVER_RAIL > 0)
+    OpexMulti1AirOverRail(affordable, capitalBudget, MULTI1_AIR_OVER_RAIL);
+  if (DECISION_LOG)
+    OpexEstimDTraceTopK(alternatives, affordable, capitalBudget, kDec, realSelection);
+  if (spEpilogue != null) OpexSpanEnd(spEpilogue);
+  if (spSelect != null) OpexSpanEnd(spSelect);
+  return affordable;
+}
+
+/* Early-slot ne falsifie ni profitAnnual ni revenueAnnual. Le bonus n'existe
+ * qu'au moment du classement, afin de payer temporairement une prime strategique
+ * pour securiser des slots aeroportuaires dans les grandes villes. */
+function OpexProjectSelectionScore(project, field)
+{
+  if (project == null) return 0.0;
+  local score = project[field];
+  if (!("mode" in project) || project.mode != "air") return score;
+  if (!("earlySlotBonusPct" in project)) return score;
+  local bonusPct = project.earlySlotBonusPct;
+  if (bonusPct <= 0) return score;
+  local factor = (100.0 + bonusPct.tofloat()) / 100.0;
+  return score * factor;
+}
+
+/* Insertion bornee et stable avec classe defensive C77 permanente. */
+function OpexProjectInsertDefensive(best, project, field, limit, applyEarlySlot = false, forceHistoric = false)
+{
+  local useBisect = !forceHistoric
+      && !(C122_AIR_REGIME_SHADOW && C121_AIR_PROJECT_REALIZATION_REGIME == 0);
+
+  local pos = 0;
+  if (useBisect) {
+    local projectC77Tier = OpexProjectDefensiveAirPriority(project);
+    local projectTier = projectC77Tier;
+    local projectScore = applyEarlySlot ? OpexProjectSelectionScore(project, field) : project[field];
+    local projectRevenue = ("revenueAnnual" in project) ? project.revenueAnnual : 0;
+
+    project.rawset("_bsTier", projectTier);
+    project.rawset("_bsScore", projectScore);
+    project.rawset("_bsRevenue", projectRevenue);
+    project.rawset("_bsField", field);
+    project.rawset("_bsEarly", applyEarlySlot);
+    project.rawset("_bsStamp", SELECT_BISECT_STAMP);
+
+    local lo = 0;
+    local hi = best.len();
+    while (lo < hi) {
+      local mid = (lo + hi) / 2;
+      local prior = best[mid];
+      local priorTier = 0;
+      local priorScore = 0;
+      local priorRevenue = 0;
+      if (("_bsStamp" in prior) && prior._bsStamp == SELECT_BISECT_STAMP
+          && prior._bsField == field && prior._bsEarly == applyEarlySlot) {
+        priorTier = prior._bsTier;
+        priorScore = prior._bsScore;
+        priorRevenue = prior._bsRevenue;
+      } else {
+        local priorC77Tier = OpexProjectDefensiveAirPriority(prior);
+        priorTier = priorC77Tier;
+        priorScore = applyEarlySlot ? OpexProjectSelectionScore(prior, field) : prior[field];
+        priorRevenue = ("revenueAnnual" in prior) ? prior.revenueAnnual : 0;
+        prior.rawset("_bsTier", priorTier);
+        prior.rawset("_bsScore", priorScore);
+        prior.rawset("_bsRevenue", priorRevenue);
+        prior.rawset("_bsField", field);
+        prior.rawset("_bsEarly", applyEarlySlot);
+        prior.rawset("_bsStamp", SELECT_BISECT_STAMP);
+      }
+      local keepsPrior = false;
+      if (priorTier > projectTier) {
+        keepsPrior = true;
+      } else if (priorTier == projectTier) {
+        if (priorScore > projectScore) {
+          keepsPrior = true;
+        } else if (priorScore == projectScore) {
+          keepsPrior = (priorRevenue >= projectRevenue);
+        }
+      }
+      if (keepsPrior) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    pos = lo;
+  } else {
+    local projectC77Tier = OpexProjectDefensiveAirPriority(project);
+    local projectTier = projectC77Tier;
+    local projectScore = applyEarlySlot ? OpexProjectSelectionScore(project, field) : project[field];
+    pos = best.len();
+    while (pos > 0) {
+      local prior = best[pos - 1];
+      local priorC77Tier = OpexProjectDefensiveAirPriority(prior);
+      local priorTier = priorC77Tier;
+      if (priorTier > projectTier) break;
+      if (priorTier < projectTier) {
+        pos--;
+        continue;
+      }
+      local priorScore = applyEarlySlot ? OpexProjectSelectionScore(prior, field) : prior[field];
+      local projectAir = ("mode" in project) && project.mode == "air";
+      local priorAir = ("mode" in prior) && prior.mode == "air";
+      /* Shadow seulement : comparer apres le verrou race sans modifier l'ordre. */
+      if (C122_AIR_REGIME_SHADOW
+          && C121_AIR_PROJECT_REALIZATION_REGIME == 0 && projectAir && priorAir) {
+        local projectRegimeTier = OpexC122AirRegimeTier(project);
+        local priorRegimeTier = OpexC122AirRegimeTier(prior);
+        local economicKeepsPrior = priorScore > projectScore
+            || (priorScore == projectScore && prior.revenueAnnual >= project.revenueAnnual);
+        if (priorRegimeTier > projectRegimeTier && !economicKeepsPrior) {
+          OpexC122TraceShadow("prior", project, prior, projectC77Tier, priorC77Tier,
+              projectRegimeTier, priorRegimeTier, field);
+        } else if (priorRegimeTier < projectRegimeTier && economicKeepsPrior) {
+          OpexC122TraceShadow("project", project, prior, projectC77Tier, priorC77Tier,
+              projectRegimeTier, priorRegimeTier, field);
+        }
+      }
+      if (priorScore > projectScore) break;
+      if (priorScore == projectScore && prior.revenueAnnual >= project.revenueAnnual) break;
+      pos--;
+    }
+  }
+  best.insert(pos, project);
+  if (best.len() > limit) {
+    local dropped = best.pop();
+    if (PROBE_SELECT_REJECT && limit > 1 && ("mode" in dropped) && dropped.mode == "air") {
+      OpexSelectRejectLogTopK(dropped, best, limit);
+    }
+  }
+}
+
+/* C78 / course defensive live : `best` peut survivre plusieurs passages projects
+ * sans repasser par OpexReselectProjects. Rafraichir uniquement ce petit ensemble
+ * deja finance (PROJECT_TOP_K, 64 par defaut) permet donc de reagir a l'arrivee
+ * d'un premier aeroport concurrent sans regenerer ni rescanner tout le vivier.
+ * Les projets non AIR gardent leur ordre ; parmi les AIR defensifs, on conserve le
+ * meme score/tie-break que la selection finale. */
+function OpexPromoteLiveDefensiveAir(projects, capitalBudget)
+{
+  if (projects == null || !("best" in projects)
+      || projects.best == null || projects.best.len() == 0) return null;
+  local earlyState = null;
+  local defensiveState = null;
+  local bestIndex = -1;
+  local bestTier = 0;
+  local bestScore = 0.0;
+  local bestRevenue = 0;
+  local limit = projects.best.len() < PROJECT_TOP_K ? projects.best.len() : PROJECT_TOP_K;
+
+  for (local i = 0; i < limit; i++) {
+    local project = projects.best[i];
+    if (project == null || !("mode" in project) || project.mode != "air") continue;
+    if (!("profitAnnual" in project) || project.profitAnnual <= 0) continue;
+    if (OpexProjectFinanceCapital(project) > capitalBudget) continue;
+
+    if (defensiveState == null) {
+      earlyState = OpexEarlySlotSelectionState();
+      defensiveState = OpexDefensiveSlotSelectionState(earlyState);
+    }
+    OpexProjectRefreshEarlySlot(project, earlyState);
+    OpexProjectRefreshDefensiveSlot(project, defensiveState);
+    local tier = OpexProjectDefensiveAirPriority(project);
+    if (tier <= 0) continue;
+
+    local score = ("fundScore" in project)
+        ? OpexProjectSelectionScore(project, "fundScore") : project.budgetScore;
+    local revenue = ("revenueAnnual" in project) ? project.revenueAnnual : 0;
+    if (bestIndex < 0 || tier > bestTier
+        || (tier == bestTier && (score > bestScore
+            || (score == bestScore && revenue > bestRevenue)))) {
+      bestIndex = i;
+      bestTier = tier;
+      bestScore = score;
+      bestRevenue = revenue;
+    }
+  }
+
+  if (bestIndex < 0) return null;
+  local chosen = projects.best[bestIndex];
+  if (bestIndex > 0) {
+    projects.best.remove(bestIndex);
+    projects.best.insert(0, chosen);
+    if (C78_SLOT_INTERCEPT_PROBE) {
+      local defensiveTownA = ("defensiveSlotTownA" in chosen) ? chosen.defensiveSlotTownA : -1;
+      local defensiveTownB = ("defensiveSlotTownB" in chosen) ? chosen.defensiveSlotTownB : -1;
+      OpexC78SlotLog("phase=defensive_priority action=promote from_rank=" + bestIndex
+          + " tick=" + AIController.GetTick()
+          + " finance=" + OpexProjectFinanceCapital(chosen)
+          + " tier=" + bestTier
+          + " townA=" + defensiveTownA + " townB=" + defensiveTownB
+          + " defensive_claims=" + chosen.defensiveSlotClaims
+          + " competitor_claims=" + (("defensiveCompetitorClaims" in chosen)
+              ? chosen.defensiveCompetitorClaims : 0)
+          + " own_claims=" + (("defensiveOwnClaims" in chosen) ? chosen.defensiveOwnClaims : 0));
+    }
+  }
+  return chosen;
+}
+
+function OpexLogVivier(path, candidates, stats, capitalBudget, capitalRemaining)
+{
+  if (!DECISION_LOG) return;
+  if (DECISION_LOG) {
+    local poolCapital = ("selectionPoolCapital" in stats) ? stats.selectionPoolCapital
+        : (("selectedCapital" in stats) ? stats.selectedCapital : 0);
+    local nextCapital = ("nextProjectCapital" in stats) ? stats.nextProjectCapital : 0;
+    OpexDecide("VIVIER", "path=" + path + " considered=" + stats.budgetConsidered
+               + " selected=" + stats.budgetSelected + " pool_selected=" + stats.budgetSelected
+               + " rejected=" + stats.budgetRejected + " not_selected=" + stats.budgetRejected
+               + " budget=" + capitalBudget + " selection_pool_capital=" + poolCapital
+               + " next_capital=" + nextCapital + " remaining=" + capitalRemaining
+               + " pool_headroom=" + capitalRemaining
+               + " sel_ops=" + (("selectionOpcodes" in stats) ? stats.selectionOpcodes : -1));
+  }
+  if (candidates == null) return;
+  if (DECISION_LOG) {
+    local rail = 0;
+    local road = 0;
+    local air = 0;
+    local water = 0;
+    local seenSrcs = {};
+    local seenDsts = {};
+    local seenPairs = {};
+    local nSrcs = 0;
+    local nDsts = 0;
+    local nPairs = 0;
+    foreach (p in candidates) {
+      if (p == null) continue;
+      local m = ("mode" in p) ? p.mode : null;
+      if (m == "rail") rail++;
+      else if (m == "road") road++;
+      else if (m == "air") air++;
+      else if (m == "water") water++;
+
+      if (("src" in p) && ("dst" in p) && p.src != null && p.dst != null) {
+        local s = p.src;
+        local d = p.dst;
+        local sk = "" + s;
+        if (!(sk in seenSrcs)) { seenSrcs[sk] <- true; nSrcs++; }
+        local dk = "" + d;
+        if (!(dk in seenDsts)) { seenDsts[dk] <- true; nDsts++; }
+        local pk = "" + s + ":" + d;
+        if (!(pk in seenPairs)) { seenPairs[pk] <- true; nPairs++; }
+      }
+    }
+    local total = candidates.len();
+    OpexDecide("VIVIER_MIX", "rail=" + rail + " road=" + road + " air=" + air
+               + " water=" + water + " total=" + total);
+    OpexDecide("VIVIER_DIV", "srcs=" + nSrcs + " dsts=" + nDsts + " pairs=" + nPairs
+               + " total=" + total);
+  }
+}
+
+function OpexProjectsStampSelectionStats(stats, projects, alternatives, funded, capitalBudget, extras)
+{
+  local minCap = -1;
+  local nextCap = -1;
+  foreach (p in alternatives) {
+    local cap = OpexProjectFinanceCapital(p);
+    if (("mode" in p) && p.mode == "fleet" && ("payload" in p) && p.payload != null
+        && ("planePrice" in p.payload) && p.payload.planePrice > 0) {
+      local planePrice = p.payload.planePrice;
+      local want = ("want" in p.payload) ? p.payload.want : 1;
+      local fitQty = ((capitalBudget - ((ESTIM_UNIFIE & 2) != 0 ? 0 : 1000)) / planePrice).tointeger();
+      if (fitQty < 0) fitQty = 0;
+      if (fitQty < want) cap = (fitQty + 1) * planePrice + ((ESTIM_UNIFIE & 2) != 0 ? 0 : 1000);
+    }
+    if (cap > capitalBudget && (nextCap < 0 || cap < nextCap)) nextCap = cap;
+  }
+  stats.nextProjectCapital = nextCap;
+  /* minCapital ne sert qu'a expliquer une selection vide. Eviter de
+   * rescanner tout le vivier quand un projet financable existe deja. */
+  if (funded.len() == 0) {
+    foreach (p in alternatives) {
+      local cap = OpexProjectFinanceCapital(p);
+      if (minCap < 0 || cap < minCap) minCap = cap;
+    }
+  }
+  stats.minCapital <- minCap;
+  stats.railCandidates <- (("rail" in projects) && projects.rail != null && ("candidates" in projects.rail) && projects.rail.candidates != null) ? projects.rail.candidates.len() : 0;
+  stats.roadCandidates <- (("road" in projects) && projects.road != null && ("candidates" in projects.road) && projects.road.candidates != null) ? projects.road.candidates.len() : 0;
+  stats.airPlansCount <- (("airPlans" in projects) && projects.airPlans != null) ? projects.airPlans.len() : 0;
+  stats.waterPlansCount <- (("waterPlans" in projects) && projects.waterPlans != null) ? projects.waterPlans.len() : 0;
+  if (extras != null) {
+    stats.abandonFiltered <- ("abandonFiltered" in extras) ? extras.abandonFiltered : 0;
+    stats.abandonedPairsCount <- ("abandonedPairsCount" in extras) ? extras.abandonedPairsCount : 0;
+    stats.cacheScanned <- ("cacheScanned" in extras) ? extras.cacheScanned : 0;
+    stats.cacheRetained <- ("cacheRetained" in extras) ? extras.cacheRetained : 0;
+  } else {
+    if (!("abandonFiltered" in stats)) stats.abandonFiltered <- 0;
+    if (!("abandonedPairsCount" in stats)) stats.abandonedPairsCount <- 0;
+    if (!("cacheScanned" in stats)) stats.cacheScanned <- 0;
+    if (!("cacheRetained" in stats)) stats.cacheRetained <- 0;
+  }
+  local emptyCause = "";
+  if (funded.len() == 0) {
+    if (alternatives.len() == 0) {
+      local cacheScanned = stats.cacheScanned;
+      local cacheRetained = stats.cacheRetained;
+      local abandonFiltered = stats.abandonFiltered;
+      local modeC = ("modeCandidates" in stats) ? stats.modeCandidates : 0;
+      if (cacheScanned > 0 && cacheRetained == 0) {
+        emptyCause = (abandonFiltered > 0) ? "abandon_filtered" : "cache_exhausted";
+      } else if (abandonFiltered > 0 && modeC == 0) {
+        emptyCause = "abandon_filtered";
+      } else if (modeC == 0) {
+        emptyCause = "stage_empty";
+      } else {
+        emptyCause = "empty_pool";
+      }
+    } else if (minCap > capitalBudget) {
+      emptyCause = "all_unaffordable";
+    } else {
+      emptyCause = "selection_empty";
+    }
+  }
+  stats.emptyCause <- emptyCause;
+}
+
+/* V158 : Materialise la selection si elle a ete differee par air_publish_lazy_select. */
+function OpexEnsureSelection(owner)
+{
+  if (owner == null || owner._projects == null) return;
+  local projects = owner._projects;
+  if (!("selectionStale" in projects) || !projects.selectionStale) return;
+  local capital = OpexAvailableCapital();
+  local railStock = ("_railReadyStock" in owner) ? owner._railReadyStock : null;
+  OpexReselectProjects(projects, capital, owner._abandonedPairs, owner._lines, railStock);
+  owner._ranked = ("rail" in projects) ? projects.rail : null;
+  if ("_lazyMaterializedYear" in owner) owner._lazyMaterializedYear++;
+}
+
+/* V279 : Filtre AIR memoise sous estampille d'invalidation.
+ * Mode 1 : revalidation incrementale exacte (utilise le cache si estampille valide, sauf creneau secondaire).
+ * Mode 2 : controle actif (evalue l'historique a chaque appel, compare avec la memoisation, alerte sur divergence). */
+function OpexFilterAirAlternativesV279Memo(alternatives, abandonedPairs = null, lines = null)
+{
+  if (V279_RESELECT_MEMO == 0) {
+    return OpexFilterAirAlternativesStillValid(alternatives, abandonedPairs, lines);
+  }
+
+  local month = OpexAir0310SiteValidityMonth();
+  local hasLines = (lines != null);
+  if (month != V279_LAST_MONTH
+      || OPEX_LINES_REVISION != V279_LAST_LINES_REV
+      || OPEX_AIR_SITE_EPOCH != V279_LAST_SITE_EPOCH
+      || OPEX_ABANDON_REVISION != V279_LAST_ABND_REV
+      || OPEX_AIR_ROLLBACK_REVISION != V279_LAST_ROLLBACK_REV
+      || hasLines != V279_LAST_HAS_LINES) {
+    V279_FILTER_STAMP_ID++;
+    V279_LAST_MONTH = month;
+    V279_LAST_LINES_REV = OPEX_LINES_REVISION;
+    V279_LAST_SITE_EPOCH = OPEX_AIR_SITE_EPOCH;
+    V279_LAST_ABND_REV = OPEX_ABANDON_REVISION;
+    V279_LAST_ROLLBACK_REV = OPEX_AIR_ROLLBACK_REVISION;
+    V279_LAST_HAS_LINES = hasLines;
+  }
+
+  if (V279_LAST_STATS_MONTH < 0) {
+    V279_LAST_STATS_MONTH = month;
+  } else if (month != V279_LAST_STATS_MONTH) {
+    local total = V279_HITS + V279_MISSES;
+    local pct = (total > 0) ? ((V279_HITS * 100) / total) : 0;
+    OpexDecide("V279_STATS", "month=" + V279_LAST_STATS_MONTH + " hits=" + V279_HITS + " misses=" + V279_MISSES + " total=" + total + " hit_pct=" + pct);
+    V279_LAST_STATS_MONTH = month;
+  }
+
+  local live = [];
+  local stationLimitedTowns = null;
+  local validity = null;
+
+  if (V279_RESELECT_MEMO == 2) {
+    stationLimitedTowns = {};
+    validity = OpexAir0310SiteValidityBegin(stationLimitedTowns);
+  }
+
+  foreach (project in alternatives) {
+    if (project != null && ("mode" in project) && project.mode == "air") {
+      local plan = ("payload" in project) ? project.payload : null;
+      local isSecondSlot = false;
+      if (plan != null) {
+        local c83OwnSecondA = ("c83OwnSecondSlotA" in plan) && plan.c83OwnSecondSlotA;
+        local c83OwnSecondB = ("c83OwnSecondSlotB" in plan) && plan.c83OwnSecondSlotB;
+        isSecondSlot = (c83OwnSecondA || c83OwnSecondB);
+      }
+
+      local stampValid = !isSecondSlot && ("_v279Stamp" in project) && project._v279Stamp == V279_FILTER_STAMP_ID;
+
+      if (V279_RESELECT_MEMO == 1) {
+        if (stampValid) {
+          V279_HITS++;
+          if (project._v279Live) live.append(project);
+          continue;
+        }
+
+        V279_MISSES++;
+        if (validity == null) {
+          stationLimitedTowns = {};
+          validity = OpexAir0310SiteValidityBegin(stationLimitedTowns);
+        }
+        local isLive = false;
+        if (plan != null && !OpexCandidateIsAbandoned(project, abandonedPairs)) {
+          if (("siteA" in plan) && ("siteB" in plan) && ("airport" in plan) && ("plane" in plan)) {
+            local reuseA = ("reuseA" in plan) && plan.reuseA;
+            local reuseB = ("reuseB" in plan) && plan.reuseB;
+            local keyA = (reuseA ? "R|" : "N|") + plan.airport.type + "|" + plan.plane.planeType + "|" + plan.siteA.anchor;
+            local keyB = (reuseB ? "R|" : "N|") + plan.airport.type + "|" + plan.plane.planeType + "|" + plan.siteB.anchor;
+            if (OpexAir0310SiteValidityOk(validity, keyA,
+                  plan.siteA, plan.airport, plan.plane, reuseA, stationLimitedTowns)
+                && OpexAir0310SiteValidityOk(validity, keyB,
+                  plan.siteB, plan.airport, plan.plane, reuseB, stationLimitedTowns)) {
+              isLive = true;
+            }
+          }
+        }
+        if (!isSecondSlot) {
+          project.rawset("_v279Stamp", V279_FILTER_STAMP_ID);
+          project.rawset("_v279Live", isLive);
+        }
+        if (isLive) live.append(project);
+      } else if (V279_RESELECT_MEMO == 2) {
+        local histLive = false;
+        if (plan != null && !OpexCandidateIsAbandoned(project, abandonedPairs)) {
+          if (("siteA" in plan) && ("siteB" in plan) && ("airport" in plan) && ("plane" in plan)) {
+            local reuseA = ("reuseA" in plan) && plan.reuseA;
+            local reuseB = ("reuseB" in plan) && plan.reuseB;
+            local keyA = (reuseA ? "R|" : "N|") + plan.airport.type + "|" + plan.plane.planeType + "|" + plan.siteA.anchor;
+            local keyB = (reuseB ? "R|" : "N|") + plan.airport.type + "|" + plan.plane.planeType + "|" + plan.siteB.anchor;
+            if (OpexAir0310SiteValidityOk(validity, keyA,
+                  plan.siteA, plan.airport, plan.plane, reuseA, stationLimitedTowns)
+                && OpexAir0310SiteValidityOk(validity, keyB,
+                  plan.siteB, plan.airport, plan.plane, reuseB, stationLimitedTowns)) {
+              histLive = true;
+            }
+          }
+        }
+
+        if (stampValid) {
+          V279_HITS++;
+          local memoLive = ("_v279Live" in project) ? project._v279Live : false;
+          if (memoLive != histLive) {
+            local townA = (plan != null && ("siteA" in plan) && ("town" in plan.siteA) && plan.siteA.town != null && ("id" in plan.siteA.town)) ? plan.siteA.town.id : -1;
+            local townB = (plan != null && ("siteB" in plan) && ("town" in plan.siteB) && plan.siteB.town != null && ("id" in plan.siteB.town)) ? plan.siteB.town.id : -1;
+            local diffMsg = "filter town_a=" + townA + " town_b=" + townB + " memo=" + (memoLive ? 1 : 0) + " hist=" + (histLive ? 1 : 0) + " stamp=" + V279_FILTER_STAMP_ID;
+            OpexDecide("V279_CHECK", diffMsg);
+            if (!DECISION_LOG) {
+              AILog.Warning("V279_CHECK " + diffMsg);
+            }
+          }
+        } else {
+          V279_MISSES++;
+        }
+
+        if (!isSecondSlot) {
+          project.rawset("_v279Stamp", V279_FILTER_STAMP_ID);
+          project.rawset("_v279Live", histLive);
+        }
+        if (histLive) live.append(project);
+      }
+    } else {
+      live.append(project);
+    }
+  }
+  return live;
+}
+
+/* ROAD100-25 : au moment exact de la publication du portefeuille (sync ET
+ * PO01C), les lignes actuelles priment sur un snapshot de generation ancien.
+ * Le constructeur continue a verifier la ville au dernier instant ; ce filtre
+ * n'ajoute ni abandon persistant, ni revenu estime, ni nouveau score. */
+function OpexRoad100FilterLiveBusTownProjects(alternatives, lines)
+{
+  if (!ROAD100_PAX_LIVE_FILTER || lines == null) return alternatives;
+  local served = {};
+  foreach (line in lines) {
+    if (line == null || !("mode" in line) || line.mode != "road"
+        || (("scrapping" in line) && line.scrapping)
+        || !("cargo" in line) || line.cargo < 0
+        || !AICargo.HasCargoClass(line.cargo, AICargo.CC_PASSENGERS)) continue;
+    local aTown = (("srcTown" in line) && line.srcTown >= 0)
+        ? line.srcTown : AITile.GetClosestTown(line.originA);
+    local bTown = (("dstTown" in line) && line.dstTown >= 0)
+        ? line.dstTown : AITile.GetClosestTown(line.originB);
+    if (aTown >= 0) served.rawset(aTown, true);
+    if (bTown >= 0) served.rawset(bTown, true);
+  }
+  if (served.len() == 0) return alternatives;
+  local live = [];
+  local dropped = 0;
+  foreach (project in alternatives) {
+    if (project != null && ("mode" in project) && project.mode == "road"
+        && ("kind" in project) && project.kind == "pax"
+        && ("payload" in project) && project.payload != null
+        && !(ROAD1Y_PAX_SITES && ("road1yBusSite" in project.payload))
+        && !(("isRoadExtension" in project.payload) && project.payload.isRoadExtension)
+        && !(ROAD100_MULTICATCHMENT
+             && ("road100MultiCatchment" in project.payload)
+             && project.payload.road100MultiCatchment)) {
+      local towns = OpexGetCandidateTownEndpoints(project.payload);
+      if ((towns.srcTown >= 0 && (towns.srcTown in served))
+          || (towns.dstTown >= 0 && (towns.dstTown in served))) {
+        dropped++;
+        continue;
+      }
+    }
+    live.append(project);
+  }
+  if (DECISION_LOG && dropped > 0) OpexDecide("ROAD100_PAX_LIVE",
+      "phase=reselect dropped=" + dropped + " before=" + alternatives.len()
+      + " after=" + live.len() + " served_towns=" + served.len());
+  return live;
+}
+
+/* Rejoue UNIQUEMENT la contrainte de capital sur les projets deja produits par le catalogue.
+ * candidateGroups porte le vivier ; cette fonction se contente de reaplatir ses alternatives et
+ * de retester le capital. Aucune planification rail, recherche de site aerien ou generation de
+ * route ne repasse ici. Les statistiques sont remplacees ensemble car IG| et IB| doivent decrire
+ * la meme solution que best, y compris lorsque la selection n'a pas prouve son optimum. */
+function OpexReselectProjects(projects, capitalBudget, abandonedPairs = null, lines = null, railReadyStock = null)
+{
+  if (projects != null && ("selectionStale" in projects)) {
+    projects.selectionStale = false;
+  }
+  local spReselect = PROBE_SPAN_TRACE ? OpexSpanBegin("select.reselect") : null;
+  local b6BudgetDate = AIDate.GetCurrentDate();
+  local funded = null;
+  local considered = 0;
+  local opsMark = OpexOpsMeasureBegin();
+  local alternatives = [];
+  local spPubFlat = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.flatten") : null;
+  foreach (key, list in projects.candidateGroups) {
+    foreach (project in list) alternatives.push(project);
+  }
+  if (spPubFlat != null) OpexSpanEnd(spPubFlat);
+  local spPubMerge = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.merge") : null;
+  if ((MODE_AIR && MODE_RAIL) && !C121_CATALOG_FIRST_YEAR_ACTIVE) {
+    if (railReadyStock == null && ("railReadyStock" in projects) && projects.railReadyStock != null)
+      railReadyStock = projects.railReadyStock;
+    alternatives = OpexRailPrepMergeAlternatives(alternatives, railReadyStock);
+  }
+  if (spPubMerge != null) OpexSpanEnd(spPubMerge);
+  local spPubFilt = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.filter") : null;
+  alternatives = (V279_RESELECT_MEMO != 0)
+      ? OpexFilterAirAlternativesV279Memo(alternatives, abandonedPairs, lines)
+      : OpexFilterAirAlternativesStillValid(alternatives, abandonedPairs, lines);
+  if (ROAD100_PAX_LIVE_FILTER)
+    alternatives = OpexRoad100FilterLiveBusTownProjects(alternatives, lines);
+  /* EB-14 publie RAIL directement dans candidateGroups. Ce parcours de
+   * re-selection (contrairement a OpexBuildProjects) doit proteger la
+   * premiere liaison AIR : publier un RAIL ne lui donne pas le droit de
+   * consommer sa tresorerie avant la premiere construction AIR. */
+  if (EB14_PROGRESSIVE && MODE_AIR && C121_CATALOG_FIRST_YEAR_ACTIVE) {
+    local airFirst = [];
+    foreach (project in alternatives)
+      if (project.mode == "air") airFirst.append(project);
+    alternatives = airFirst;
+  }
+  if (spPubFilt != null) OpexSpanEnd(spPubFilt);
+  local spPubScore = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.score") : null;
+  funded = OpexProjectSelectAffordable(alternatives, capitalBudget, PROJECT_TOP_K, true, abandonedPairs);
+  if (RAIL_FAILURE_AUDIT) OpexRailPortfolioAudit("reselect", alternatives, funded,
+      capitalBudget, 0, 0);
+  if (spPubScore != null) OpexSpanEnd(spPubScore);
+  considered = alternatives.len();
+  projects.stats.knapsackNodes = 0;
+  projects.stats.knapsackExact = false;
+  projects.stats.selectionOpcodes <- OpexOpsMeasureEnd(opsMark);
+  local spPubLog = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.log") : null;
+  OpexB6LogSelectionCausality("reselect", alternatives, funded, capitalBudget, b6BudgetDate);
+  if (V216_PROBE) OpexV216LogSelection("reselect", alternatives, funded, capitalBudget);
+  if (spPubLog != null) OpexSpanEnd(spPubLog);
+
+  local spPubStats = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.stats") : null;
+  projects.stats.budgetConsidered = considered;
+  projects.stats.budgetSelected = funded.len();
+  projects.stats.budgetRejected = considered - funded.len();
+
+  local selectedRev = 0;
+  local selectedCap = 0;
+  foreach (project in funded) {
+    selectedRev += project.revenueAnnual;
+    selectedCap += OpexProjectFinanceCapital(project);
+  }
+  projects.stats.selectedRevenue = selectedRev;
+  projects.stats.selectedCapital = selectedCap;
+  if ("selectionPoolCapital" in projects.stats) projects.stats.selectionPoolCapital = selectedCap;
+  else projects.stats.selectionPoolCapital <- selectedCap;
+  local nextProjectCapital = funded.len() > 0 ? OpexProjectFinanceCapital(funded[0]) : 0;
+  if ("nextProjectCapital" in projects.stats) projects.stats.nextProjectCapital = nextProjectCapital;
+  else projects.stats.nextProjectCapital <- nextProjectCapital;
+
+  projects.capitalBudget = capitalBudget;
+  projects.capitalRemaining = capitalBudget - selectedCap;
+  if (projects.capitalRemaining < 0) projects.capitalRemaining = 0;
+
+  OpexProjectsStampSelectionStats(projects.stats, projects, alternatives, funded, capitalBudget, null);
+
+  projects.best = funded;
+  if (EB14_PROGRESSIVE && DECISION_LOG && DEBUG_SIGNS)
+    OpexEB14RailTraceSelection(funded);
+  if ((MODE_AIR && MODE_RAIL) && railReadyStock != null) {
+    if ("railReadyStock" in projects) projects.railReadyStock = railReadyStock;
+    else projects.railReadyStock <- railReadyStock;
+  }
+  if (C69_BOTTLENECK_PROBE) {
+    projects.c69Best <- ::C69_LAST_AFFORDABLE;
+    projects.c69KDecData <- ::C69_LAST_KDEC_DATA;
+  }
+  if (spPubStats != null) OpexSpanEnd(spPubStats);
+
+  local spPubVivier = PROBE_SPAN_TRACE ? OpexSpanBegin("pub.select.vivier") : null;
+  if (DECISION_LOG) {
+    local vivierPool = [];
+    if (("candidateGroups" in projects) && projects.candidateGroups != null) {
+      foreach (key, list in projects.candidateGroups) {
+        foreach (project in list) vivierPool.push(project);
+      }
+    }
+    OpexLogVivier("reselect", vivierPool, projects.stats, projects.capitalBudget, projects.capitalRemaining);
+  }
+  if (spPubVivier != null) OpexSpanEnd(spPubVivier);
+
+  if (spReselect != null) OpexSpanEnd(spReselect);
+  return projects;
+}
+
+/* C76/C77 : reconstruit une seule famille modale et la reinjecte dans le vivier
+ * existant. Le classement final reste OpexProjectSelectAffordable via
+ * OpexReselectProjects ; aucun score n'est redefini ici. */
+function OpexProjectTouchesEntity(project, entityKind, entityId)
+{
+  if (project == null || entityKind == null || entityId < 0) return false;
+  local payload = (("payload" in project) && project.payload != null) ? project.payload : null;
+  if (entityKind == "town") {
+    if (payload != null) {
+      if (("srcTown" in payload) && payload.srcTown == entityId) return true;
+      if (("dstTown" in payload) && payload.dstTown == entityId) return true;
+      if (("siteA" in payload) && payload.siteA != null && ("town" in payload.siteA)
+          && payload.siteA.town != null && ("id" in payload.siteA.town)
+          && payload.siteA.town.id == entityId) return true;
+      if (("siteB" in payload) && payload.siteB != null && ("town" in payload.siteB)
+          && payload.siteB.town != null && ("id" in payload.siteB.town)
+          && payload.siteB.town.id == entityId) return true;
+    }
+    return false;
+  }
+  if (entityKind == "industry") {
+    if (payload != null) {
+      if (("srcIndustry" in payload) && payload.srcIndustry == entityId) return true;
+      if (("dstIndustry" in payload) && payload.dstIndustry == entityId) return true;
+    }
+    if (("src" in project) && AIMap.IsValidTile(project.src)
+        && AIIndustry.GetIndustryID(project.src) == entityId) return true;
+    if (("dst" in project) && AIMap.IsValidTile(project.dst)
+        && AIIndustry.GetIndustryID(project.dst) == entityId) return true;
+    return false;
+  }
+  if (entityKind == "subsidy" && payload != null
+      && ("isSubsidy" in payload) && payload.isSubsidy
+      && ("subsidyId" in payload)) {
+    return payload.subsidyId == entityId;
+  }
+  return false;
+}
+
+function OpexProjectIsPersistentSpecial(project)
+{
+  if (project == null || !(("payload" in project)) || project.payload == null) return false;
+  if (("isSubsidy" in project.payload) && project.payload.isSubsidy) return true;
+  if (("isRoadExtension" in project.payload) && project.payload.isRoadExtension) return true;
+  return false;
+}
+
+function OpexProjectsRecountGroups(projects)
+{
+  if (projects == null || !(("candidateGroups" in projects)) || projects.candidateGroups == null) return;
+  local od = 0;
+  local n = 0;
+  local alternatives = 0;
+  foreach (key, list in projects.candidateGroups) {
+    if (list == null || list.len() == 0) continue;
+    od++;
+    n += list.len();
+    if (list.len() > 1) alternatives += list.len() - 1;
+  }
+  projects.all = od;
+  if (projects.stats != null) {
+    projects.stats.odProjects = od;
+    projects.stats.modeCandidates = n;
+    projects.stats.modeAlternatives = alternatives;
+  }
+}

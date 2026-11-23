@@ -1,0 +1,1381 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 jrdoublet
+/* C65 : deplace depuis main.nut (passe 1, deplacement pur, aucun corps retouche). */
+function OpexSaveRailExpansion(state)
+{
+  if (state == null || typeof state != "table") return null;
+  /* Le format de sauvegarde NoAI refuse les floats. _continueRailExpansion() n'a besoin
+   * que de ces champs ; newSpeed/newOneWayDays sont donc conserves en milli-unites entieres. */
+  return {
+    lineId = state.lineId,
+    vehicle = state.vehicle,
+    wagonId = state.wagonId,
+    oldWagons = ("oldWagons" in state) ? state.oldWagons : (state.newWagons - 1),
+    newWagons = state.newWagons,
+    oldTrainLength = ("oldTrainLength" in state) ? state.oldTrainLength : -1,
+    oldExpansionCount = ("oldExpansionCount" in state) ? state.oldExpansionCount : 0,
+    decisionYear = ("decisionYear" in state) ? state.decisionYear : -1,
+    newSpeedMilli = (state.newSpeed * 1000).tointeger(),
+    newOneWayMilliDays = (state.newOneWayDays * 1000).tointeger(),
+    decisionDate = state.decisionDate,
+    waitDays = state.waitDays,
+    startDate = state.startDate,
+    phase = state.phase,
+    dispatchAttempts = state.dispatchAttempts,
+    resumeAttempts = ("resumeAttempts" in state) ? state.resumeAttempts : 0,
+    temporaryOrder = state.temporaryOrder,
+    temporaryOrderPosition = state.temporaryOrderPosition,
+    commitStage = ("commitStage" in state) ? state.commitStage : "idle",
+    pendingWagon = ("pendingWagon" in state) ? state.pendingWagon : -1,
+    ops = state.ops,
+    cost = state.cost,
+  };
+}
+
+function OpexLoadRailExpansion(data)
+{
+  if (data == null || typeof data != "table") return null;
+  local required = ["lineId", "vehicle", "wagonId", "oldWagons", "newWagons",
+                    "oldTrainLength", "oldExpansionCount", "decisionYear",
+                    "newSpeedMilli", "newOneWayMilliDays", "decisionDate", "waitDays",
+                    "startDate", "phase", "dispatchAttempts", "temporaryOrder",
+                    "temporaryOrderPosition", "commitStage", "pendingWagon", "ops", "cost"];
+  foreach (key in required) {
+    if (!(key in data)) return null;
+  }
+  return {
+    lineId = data.lineId,
+    vehicle = data.vehicle,
+    wagonId = data.wagonId,
+    oldWagons = data.oldWagons,
+    newWagons = data.newWagons,
+    oldTrainLength = data.oldTrainLength,
+    oldExpansionCount = data.oldExpansionCount,
+    decisionYear = data.decisionYear,
+    newSpeed = data.newSpeedMilli.tofloat() / 1000.0,
+    newOneWayDays = data.newOneWayMilliDays.tofloat() / 1000.0,
+    decisionDate = data.decisionDate,
+    waitDays = data.waitDays,
+    startDate = data.startDate,
+    phase = data.phase,
+    dispatchAttempts = data.dispatchAttempts,
+    resumeAttempts = ("resumeAttempts" in data) ? data.resumeAttempts : 0,
+    temporaryOrder = data.temporaryOrder,
+    temporaryOrderPosition = data.temporaryOrderPosition,
+    commitStage = data.commitStage,
+    pendingWagon = data.pendingWagon,
+    ops = data.ops,
+    cost = data.cost,
+  };
+}
+
+function OpexCopyBoolTable(source)
+{
+  local out = {};
+  if (source == null) return out;
+  foreach (key, val in source) out.rawset(key, val ? true : false);
+  return out;
+}
+
+function OpexSaveReactiveQueue(queue)
+{
+  /* Payload integral : inclut c77DeferDate (date entiere du premier report), sans whitelist.
+   * Le format court n'enregistre ni file ni date ; il ne restaure donc aucune attente C77. */
+  if (queue == null) return [];
+  local rawList = (typeof queue == "instance" && ("toArray" in queue)) ? queue.toArray() : queue;
+  if (rawList == null || typeof rawList != "array") return [];
+  local out = [];
+  foreach (item in rawList) {
+    if (item == null || typeof item != "table") continue;
+    if (!("key" in item) || !("kind" in item)) continue;
+    out.append({
+      key = item.key,
+      kind = item.kind,
+      payload = ("payload" in item) ? item.payload : null,
+      enqueuedDate = ("enqueuedDate" in item) ? item.enqueuedDate : 0,
+      count = ("count" in item) ? item.count : 1
+    });
+  }
+  return out;
+}
+
+function OpexLoadReactiveQueue(data)
+{
+  local q = OpexReactiveQueue();
+  if (data == null || typeof data != "array") return q;
+  foreach (item in data) {
+    if (item == null || typeof item != "table") continue;
+    if (!("key" in item) || !("kind" in item)) continue;
+    local enqueuedDate = ("enqueuedDate" in item) ? item.enqueuedDate : AIDate.GetCurrentDate();
+    local count = ("count" in item) ? item.count : 1;
+    local payload = ("payload" in item) ? item.payload : null;
+    q.restoreItem(item.key, item.kind, payload, enqueuedDate, count);
+  }
+  return q;
+}
+
+function OpexSaveActiveWorker(worker)
+{
+  if (worker == null || typeof worker != "table") return null;
+  if (!("kind" in worker) || !("state" in worker) || worker.state == null || typeof worker.state != "table") return null;
+  if (worker.kind == "rail_search" || worker.kind == "rail_stock") {
+    /* C80 : _railSearch contient un pathfinder C++ non serialisable.
+     * On ne sauvegarde pas le pathfinder dans le savegame. */
+    return {
+      kind = worker.kind,
+      state = {}
+    };
+  }
+
+  if (worker.kind == "regen_candidates") {
+    /* C78.4 : la tranche AIR contient temporairement des plans/economics avec
+     * des flottants, interdits par le format de sauvegarde. Rien n'est publie
+     * dans candidateGroups avant DONE : on peut donc jeter uniquement la
+     * tranche AIR en cours et reprendre ce mode depuis son debut apres Load. */
+    local s = worker.state;
+    local modesCopy = [];
+    if (("modes" in s) && s.modes != null && typeof s.modes == "array") {
+      foreach (mode in s.modes) modesCopy.append(mode);
+    }
+    return {
+      kind = worker.kind,
+      state = {
+        modes = modesCopy,
+        cursor = ("cursor" in s) ? s.cursor : 0,
+        targeted = ("targeted" in s) ? s.targeted : false,
+        entityKind = ("entityKind" in s) ? s.entityKind : null,
+        entityId = ("entityId" in s) ? s.entityId : -1,
+        buildAfter = ("buildAfter" in s) ? s.buildAfter : false,
+        reason = ("reason" in s) ? s.reason : "event",
+      }
+    };
+  }
+  return {
+    kind = worker.kind,
+    state = worker.state
+  };
+}
+
+function OpexLoadActiveWorker(data)
+{
+  if (data == null || typeof data != "table") return null;
+  if (!("kind" in data) || !("state" in data) || data.state == null || typeof data.state != "table") return null;
+  local kind = data.kind;
+  /* Legacy saves may contain the retired urban worker; never resume it. */
+  if (kind == "town_growth") return null;
+  if (!(kind in OPEX_WORKER_REGISTRY)) {
+    AILog.Warning("C80: dropped active worker of unknown kind: " + kind);
+    return null;
+  }
+  return {
+    kind = kind,
+    state = data.state
+  };
+}
+
+function OpexAI::_railLineHasVehicle(line, vehicle)
+{
+  if (line == null || typeof line != "table" || !("vehicles" in line) || line.vehicles == null) return false;
+  foreach (known in line.vehicles) {
+    if (known == vehicle) return true;
+  }
+  return false;
+}
+
+function OpexAI::_removePersistedRailTemporaryOrder(state, line)
+{
+  if (state == null || !("temporaryOrder" in state) || !state.temporaryOrder ||
+      !AIVehicle.IsValidVehicle(state.vehicle)) return true;
+  local pos = state.temporaryOrderPosition;
+  if (pos < 0 || !AIOrder.IsValidVehicleOrder(state.vehicle, pos) ||
+      !AIOrder.IsGotoDepotOrder(state.vehicle, pos)) {
+    state.temporaryOrder = false;
+    state.temporaryOrderPosition = -1;
+    return false;
+  }
+  if (line != null && ("depot" in line) &&
+      AIOrder.GetOrderDestination(state.vehicle, pos) != line.depot) {
+    state.temporaryOrder = false;
+    state.temporaryOrderPosition = -1;
+    return false;
+  }
+  if (!AIOrder.RemoveOrder(state.vehicle, pos)) return false;
+  state.temporaryOrder = false;
+  state.temporaryOrderPosition = -1;
+  return true;
+}
+
+function OpexAI::_commitPersistedRailExpansionMetadata(line, state)
+{
+  /* Idempotent : utiliser l'ancien compteur memorise plutot que += 1 empeche un double comptage
+   * si le save tombe sur la frontiere physique/metadata de la transaction. */
+  line.wagons = state.newWagons;
+  line.wagonId <- state.wagonId;
+  line.effectiveSpeed = state.newSpeed;
+  line.predOneWayDays = state.newOneWayDays;
+  line.headwayDays = 2 * state.newOneWayDays;
+  line.expandStreak <- 0;
+  line.railExpansions <- state.oldExpansionCount + 1;
+  line.lastExpansionYear <- state.decisionYear;
+}
+
+function OpexAI::_abortPersistedRailExpansion(state, line)
+{
+  if (state != null && ("pendingWagon" in state) && state.pendingWagon >= 0 &&
+      AIVehicle.IsValidVehicle(state.pendingWagon) &&
+      !AIVehicle.IsPrimaryVehicle(state.pendingWagon)) {
+    AIVehicle.SellVehicle(state.pendingWagon);
+    state.pendingWagon = -1;
+  }
+  if (state != null && ("vehicle" in state) && AIVehicle.IsValidVehicle(state.vehicle)) {
+    local hadTemporaryOrder = ("temporaryOrder" in state) && state.temporaryOrder;
+    this._removePersistedRailTemporaryOrder(state, line);
+    if (AIVehicle.IsStoppedInDepot(state.vehicle)) {
+      AIVehicle.StartStopVehicle(state.vehicle);
+    } else if (!hadTemporaryOrder && line != null && ("depot" in line)) {
+      /* SendVehicleToDepot est un toggle : ne l'utiliser comme annulation que si l'ordre courant
+       * est bien NOTRE diversion vers ce depot. */
+      local pos = AIOrder.ResolveOrderPosition(state.vehicle, AIOrder.ORDER_CURRENT);
+      if (pos != AIOrder.ORDER_INVALID && AIOrder.IsValidVehicleOrder(state.vehicle, pos) &&
+          AIOrder.IsGotoDepotOrder(state.vehicle, pos) &&
+          AIOrder.GetOrderDestination(state.vehicle, pos) == line.depot) {
+        AIVehicle.SendVehicleToDepot(state.vehicle);
+      }
+    }
+  }
+  if (line != null) {
+    line.expandStreak <- 0;
+    line.expandRetryCycle <- this._taskCycle + 3;
+  }
+  this._railExpansion = null;
+}
+
+function OpexAI::_reconcileRailExpansionAfterLoad()
+{
+  local result = { restored = 0, completed = 0, dropped = 0, promoted = 0,
+                   pending_recovered = 0, ambiguous_aborted = 0 };
+  if (this._railExpansion == null) return result;
+  local state = this._railExpansion;
+  local line = ("lineId" in state) ? this._findLineById(state.lineId) : null;
+  local vehicleValid = ("vehicle" in state) && AIVehicle.IsValidVehicle(state.vehicle) &&
+      AIVehicle.IsPrimaryVehicle(state.vehicle) &&
+      AIVehicle.GetVehicleType(state.vehicle) == AIVehicle.VT_RAIL;
+  local phaseValid = ("phase" in state) &&
+      (state.phase == "approach" || state.phase == "depot" || state.phase == "resume");
+  local stageValid = ("commitStage" in state) &&
+      (state.commitStage == "idle" || state.commitStage == "build_started" ||
+       state.commitStage == "wagon_built" || state.commitStage == "wagon_moved" ||
+       state.commitStage == "metadata_done");
+  local shapeValid = ("oldWagons" in state) && ("newWagons" in state) &&
+      state.newWagons == state.oldWagons + 1;
+  local lineValid = line != null && typeof line == "table" && ("mode" in line) && line.mode == "rail" &&
+      this._railLineHasVehicle(line, state.vehicle);
+  local depotValid = lineValid && ("depot" in line) && AIMap.IsValidTile(line.depot) &&
+      AIRail.IsRailDepotTile(line.depot);
+
+  if (!vehicleValid || !phaseValid || !stageValid || !shapeValid || !lineValid ||
+      (state.phase != "resume" && !depotValid)) {
+    /* Nettoyage best-effort : ne pas laisser notre ordre temporaire ni une rame arretee si le
+     * descriptor n'est plus reconciliable avec le monde charge. */
+    this._abortPersistedRailExpansion(state, line);
+    result.dropped++;
+    return result;
+  }
+
+  local currentLength = AIVehicle.GetLength(state.vehicle);
+  local physicalCommitted =
+      (("wagons" in line) && line.wagons == state.newWagons) ||
+      (state.oldTrainLength >= 0 && currentLength > state.oldTrainLength);
+
+  if (!physicalCommitted && state.commitStage == "wagon_built") {
+    local pending = state.pendingWagon;
+    local pendingValid = pending >= 0 && AIVehicle.IsValidVehicle(pending) &&
+        !AIVehicle.IsPrimaryVehicle(pending) &&
+        AIVehicle.GetVehicleType(pending) == AIVehicle.VT_RAIL &&
+        AIVehicle.GetEngineType(pending) == state.wagonId &&
+        AIVehicle.GetLocation(pending) == line.depot;
+    local fits = pendingValid &&
+        AIVehicle.GetLength(state.vehicle) + AIVehicle.GetLength(pending) <= line.platformLength * 16;
+    if (fits && AIVehicle.MoveWagon(pending, 0, state.vehicle, 0)) {
+      state.pendingWagon = -1;
+      state.commitStage = "wagon_moved";
+      currentLength = AIVehicle.GetLength(state.vehicle);
+      physicalCommitted = state.oldTrainLength < 0 || currentLength > state.oldTrainLength;
+      result.pending_recovered++;
+    } else {
+      this._abortPersistedRailExpansion(state, line);
+      result.dropped++;
+      return result;
+    }
+  }
+
+  if (!physicalCommitted && state.commitStage == "build_started") {
+    /* Etat ambigu : la commande peut avoir ete executee sans que son VehicleID ait encore ete
+     * stocke. Ne jamais relancer BuildVehicle au reload, donc jamais de double wagon. */
+    this._abortPersistedRailExpansion(state, line);
+    result.dropped++;
+    result.ambiguous_aborted++;
+    return result;
+  }
+
+  if (!physicalCommitted &&
+      (state.commitStage == "wagon_moved" || state.commitStage == "metadata_done")) {
+    this._abortPersistedRailExpansion(state, line);
+    result.dropped++;
+    return result;
+  }
+
+  if (physicalCommitted) {
+    this._commitPersistedRailExpansionMetadata(line, state);
+    state.pendingWagon = -1;
+    state.commitStage = "metadata_done";
+    state.phase = "resume";
+    result.promoted++;
+    /* Si la rame a deja quitte le depot, la reprise a donc deja reussi : surtout ne pas
+     * rappeler StartStopVehicle(), qui la stopperait a nouveau. */
+    if (!AIVehicle.IsStoppedInDepot(state.vehicle)) {
+      this._removePersistedRailTemporaryOrder(state, line);
+      this._railExpansion = null;
+      result.completed++;
+      return result;
+    }
+    this._removePersistedRailTemporaryOrder(state, line);
+    result.restored++;
+    return result;
+  }
+
+  /* Une sauvegarde prise entre l'insertion de l'ordre depot et l'affectation phase="depot" est
+   * improbable (le callback script est atomique), mais cette normalisation rend la reprise sure
+   * meme dans ce cas. */
+  if (state.temporaryOrder) {
+    local pos = state.temporaryOrderPosition;
+    local orderValid = pos >= 0 && AIOrder.IsValidVehicleOrder(state.vehicle, pos) &&
+        AIOrder.IsGotoDepotOrder(state.vehicle, pos) &&
+        AIOrder.GetOrderDestination(state.vehicle, pos) == line.depot;
+    if (orderValid) {
+      state.phase = "depot";
+    } else {
+      state.temporaryOrder = false;
+      state.temporaryOrderPosition = -1;
+      state.phase = "approach";
+    }
+  }
+  result.restored++;
+  return result;
+}
+
+function OpexAI::_filterPersistedRailRepairQueue(source)
+{
+  local out = {};
+  if (source == null) return out;
+  foreach (key, ignored in source) {
+    local lineId = key.tointeger();
+    local line = this._findLineById(lineId);
+    if (line != null && typeof line == "table" && ("mode" in line) && line.mode == "rail" &&
+        ("doubleTrack" in line) && line.doubleTrack == 1) {
+      out.rawset("" + lineId, true);
+    }
+  }
+  return out;
+}
+
+function OpexAI::_rearmPersistedRailRepairTasks()
+{
+  if (this._taskQueue == null) return;
+  foreach (task in this._taskQueue) {
+    if (task.name == "c41_rail_signals") {
+      local active = C41_RAIL_LOST_SIGNAL_REPAIR && this._c41RailSignalLines != null &&
+          this._c41RailSignalLines.len() > 0;
+      task.enabled = active;
+      task.dueCycle = active ? this._taskCycle : 2147483647;
+    } else if (task.name == "c41_rail_junction") {
+      local active = C41_RAIL_LOST_JUNCTION_REPAIR && this._c41RailJunctionLines != null &&
+          this._c41RailJunctionLines.len() > 0;
+      task.enabled = active;
+      task.dueCycle = active ? this._taskCycle : 2147483647;
+    }
+  }
+}
+
+/* Cles ajoutees seulement quand v250_rights est arme. A 0, Save() ne gagne
+ * aucun champ. L'echeance reste dans le monde (GetExclusiveRightsDuration) :
+ * on ne sauve que les villes suivies et celles dont le creneau a deja ete note. */
+function OpexSaveV250(saveObj, ai)
+{
+  if (V250_RIGHTS == 0 || saveObj == null || ai == null) return;
+  local targets = {};
+  if (ai._v250Targets != null) {
+    foreach (townId, mark in ai._v250Targets) targets.rawset(townId, mark);
+  }
+  local freed = {};
+  if (ai._v250Freed != null) {
+    foreach (townId, mark in ai._v250Freed) freed.rawset(townId, 1);
+  }
+  saveObj.v250Targets <- targets;
+  saveObj.v250Freed <- freed;
+}
+
+/* R20 : Load precede les reglages. Tampon prive a la persistance, consomme
+ * par _reconcileAfterLoad ; ni cache catalogue ni nouveau reglage public. */
+OPEX_RELOAD_C121_STRATEGY <- null;
+
+function OpexC121StrategyStateEnabled()
+{
+  return C121_AIR_PROJECT_REALIZATION_ADAPTIVE
+      || C122_AIR_REGIME_SHADOW;
+}
+
+function OpexSaveC121Strategy(saveObj)
+{
+  if (!OpexC121StrategyStateEnabled()) return;
+  local accum = null;
+  if (C121_AIR_PRESSURE_ACCUM != null) {
+    /* Copie native du seul historique utile : TownID -> minimum de slots.
+     * Toutes les valeurs produites par le collecteur sont entieres. */
+    accum = {
+      year = C121_AIR_PRESSURE_ACCUM.year,
+      samples = C121_AIR_PRESSURE_ACCUM.samples,
+      towns = clone C121_AIR_PRESSURE_ACCUM.towns,
+    };
+  }
+  saveObj.c121Strategy <- {
+    version = 1,
+    regime = C121_AIR_PROJECT_REALIZATION_REGIME,
+    yearsObserved = C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED,
+    accum = accum,
+    previous = C121_AIR_PRESSURE_PREV != null ? clone C121_AIR_PRESSURE_PREV : null,
+  };
+}
+
+/* Validation sans API monde ni drapeaux runtime (Load est trop tot).
+ * Refuser le bloc entier si incomplet/incompatible, sans demi-restauration. */
+function OpexLoadC121Strategy(data)
+{
+  if (data == null || typeof data != "table") return null;
+  foreach (key in ["version", "regime", "yearsObserved"]) {
+    if (!(key in data) || typeof data[key] != "integer") return null;
+  }
+  if (data.version != 1 || data.regime < -1 || data.regime > 1
+      || data.yearsObserved < 0 || !("accum" in data) || !("previous" in data)) return null;
+  local accum = null;
+  if (data.accum != null) {
+    local a = data.accum;
+    if (typeof a != "table") return null;
+    foreach (key in ["year", "samples"]) {
+      if (!(key in a) || typeof a[key] != "integer" || a[key] < 0) return null;
+    }
+    if (!("towns" in a) || typeof a.towns != "table") return null;
+    local towns = {};
+    foreach (townId, remaining in a.towns) {
+      if (typeof townId != "integer" || townId < 0
+          || typeof remaining != "integer" || remaining < -1) return null;
+      /* Un TownID historique n'est pas filtre selon le monde actuel : il fait
+       * partie de l'observation deja utilisee par le classifieur. */
+      towns.rawset(townId, remaining);
+    }
+    accum = { year = a.year, samples = a.samples, towns = towns };
+  }
+  local previous = null;
+  if (data.previous != null) {
+    local p = data.previous;
+    if (typeof p != "table") return null;
+    previous = {};
+    foreach (key in ["year", "open", "competitor", "locked", "other",
+                    "uniqueTowns", "samples", "pressured"]) {
+      if (!(key in p) || typeof p[key] != "integer" || p[key] < 0) return null;
+      previous.rawset(key, p[key]);
+    }
+    foreach (key in ["contestablePermille", "openPermille"]) {
+      if (!(key in p) || typeof p[key] != "integer" || p[key] < -1 || p[key] > 1000) return null;
+      previous.rawset(key, p[key]);
+    }
+  }
+  return { version = 1, regime = data.regime, yearsObserved = data.yearsObserved,
+           accum = accum, previous = previous };
+}
+
+function OpexRestoreC121Strategy(data)
+{
+  /* Migration ancienne sauvegarde : nouvelle observation, jamais un verrou
+   * invente a partir de la carte actuelle. Les caches restent reconstructibles. */
+  C121_AIR_PROJECT_REALIZATION_REGIME = -1;
+  C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED = 0;
+  C121_AIR_PRESSURE_ACCUM = null;
+  C121_AIR_PRESSURE_PREV = null;
+  if (!OpexC121StrategyStateEnabled()) return;
+  if (data == null) {
+    OpexDiagLog("C121_STRATEGY_RELOAD observation_restart: missing_or_invalid_state");
+    return;
+  }
+  C121_AIR_PROJECT_REALIZATION_REGIME = data.regime;
+  C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED = data.yearsObserved;
+  C121_AIR_PRESSURE_ACCUM = data.accum;
+  C121_AIR_PRESSURE_PREV = data.previous;
+  OpexDiagLog("C121_STRATEGY_RELOAD regime=" + data.regime
+      + " observed_years=" + data.yearsObserved
+      + " accum_year=" + (data.accum != null ? data.accum.year : -1));
+  /* Ne pas appeler PressureAdvanceYear ici : le prochain scoring cloture
+   * normalement l'annee et respecte un regime deja verrouille. */
+}
+
+/* C121 : les snapshots actual/target/capacite/opcodes servent uniquement aux
+ * probes de la partie courante. Les recopier pour 100+ lignes dans Save()
+ * finit par depasser le budget NoAI. Conserver en revanche les petits
+ * scalaires necessaires aux decisions apres reload (marginal*, arm,
+ * rawRevenue, realization, amortissement, targetAirPlanes historique). */
+OPEX_SAVE_LINE_SKIP <- {
+  c121PaxCapacity = true, c121MailCapacity = true,
+  c121DemandOps = true, c121DemandTicks = true,
+  c121EvalOps = true, c121EvalTicks = true,
+  c121ActualCarriedPax = true, c121ActualCarriedMail = true,
+  c121ActualCarried = true, c121ActualRevenueAnnual = true,
+  c121ActualProfitAnnual = true, c121ActualRunningAnnual = true,
+  c121ActualVehicleRunningAnnual = true, c121ActualAmortAnnual = true,
+  c121ActualPlanes = true, c121ActualOneWayDays = true,
+  c121ActualHeadwayDays = true, c121ActualStationRating = true,
+  c121TargetCarriedPax = true, c121TargetCarriedMail = true,
+  c121TargetCarried = true, c121TargetRevenueAnnual = true,
+  c121TargetProfitAnnual = true, c121TargetPlanes = true,
+};
+
+/* Copie serialisable d'une ligne. `clone` copie la table en natif ; on ne
+ * touche ensuite qu'aux exceptions : diagnostics C121, floats a scalariser et
+ * types non serialisables. La copie est superficielle : tableaux et tables
+ * imbriques restent partages avec la ligne vivante. */
+function OpexSaveProjectLine(line)
+{
+  local serializableLine = clone line;
+  foreach (key, val in line) {
+    if (key == "v233LongGood" && V233_LONG_GOOD <= 0) {
+      delete serializableLine[key];
+      continue;
+    }
+    if (key in OPEX_SAVE_LINE_SKIP) {
+      delete serializableLine[key];
+      continue;
+    }
+    local valType = typeof val;
+    if (valType == "float") {
+      /* Le format de sauvegarde n'admet pas le flottant : arrondir CONSERVE le champ (une
+       * metrique predite), alors que le jeter le perdrait en silence au rechargement. */
+      serializableLine[key] = val.tointeger();
+    } else if (valType != "integer" && valType != "string" && valType != "bool" &&
+               valType != "null" && valType != "array" && valType != "table") {
+      delete serializableLine[key];
+    }
+  }
+  return serializableLine;
+}
+
+/* Projection mensuelle des lignes hors de Save(). Save() s'execute sous un
+ * plafond fixe de 100k opcodes ; recopier champ par champ ~150 lignes l'a
+ * depasse (graine 314, mi-1978 : "This script took too long to Save", script
+ * tue). Ici, dans la boucle principale, le cout n'est pas plafonne. Sous
+ * SAVE_PROJECTION_MIN_LINES lignes, rien ne change : Save() projette tout. Les
+ * scalaires d'une ligne peuvent dater d'au plus un mois au rechargement. */
+SAVE_PROJECTION_MIN_LINES <- 64;
+function OpexAI::_refreshSaveProjection()
+{
+  if (!SAVE_FULL_STATE || this._lines == null || this._lines.len() < SAVE_PROJECTION_MIN_LINES) {
+    this._saveProjection = null;
+    return;
+  }
+  local today = AIDate.GetCurrentDate();
+  local month = AIDate.GetYear(today) * 12 + AIDate.GetMonth(today);
+  if (month == this._saveProjectionMonth && this._saveProjection != null) return;
+  this._saveProjectionMonth = month;
+  local cache = {};
+  foreach (line in this._lines) {
+    if (line != null && typeof line == "table") cache[line] <- OpexSaveProjectLine(line);
+  }
+  this._saveProjection = cache;
+}
+
+/* EB-14: completed RAIL bands are useful evidence, but their projects live only
+ * in _projects (which Save never serializes). Never use this journal to skip a
+ * producer after Load: published opportunities MUST be re-estimated first.
+ * All work needed to build this small, bounded table happens outside Save(). */
+const EB14_RAIL_JOURNAL_VERSION = 1;
+const EB14_RAIL_JOURNAL_MAX_UNITS = 128;
+const EB14_RAIL_JOURNAL_MAX_KEY = 96;
+/* As with OPEX_RELOAD_C121_STRATEGY above, the NoAI process owns one AI. Keep
+ * these slots here so the frozen main.nut PO01D path remains byte-identical. */
+EB14_RAIL_JOURNAL_STATE <- null;
+EB14_RAIL_JOURNAL_RELOAD <- null;
+
+function OpexEB14JournalNew()
+{
+  return { version = EB14_RAIL_JOURNAL_VERSION, diagnosticOnly = true,
+      observed = {}, dropped = 0 };
+}
+
+function OpexEB14JournalUnitKey(kind, cargo, low, high)
+{
+  if (typeof kind != "string" || (kind != "pax" && kind != "freight" && kind != "v233")
+      || typeof cargo != "integer" || cargo < 0
+      || typeof low != "integer" || low < 0
+      || typeof high != "integer" || high < low) return null;
+  local key = kind + "|" + cargo + "|" + low + "|" + high;
+  return key.len() <= EB14_RAIL_JOURNAL_MAX_KEY ? key : null;
+}
+
+/* Each checkpoint records only a FINISHED band and the C76 snapshot at which
+ * it was scanned; never the coroutine, candidate payloads, current selection,
+ * or a claimed resume cursor. This hook may be called after EB14_RAIL band_done. */
+function OpexEB14JournalRecordUnit(owner, unit, snapshot, produced, admitted)
+{
+  if (!EB14_PROGRESSIVE || owner == null || unit == null || snapshot == null
+      || typeof unit != "table" || typeof snapshot != "table"
+      || !("kind" in unit) || !("cargo" in unit) || !("low" in unit)
+      || !("high" in unit) || typeof produced != "integer" || produced < 0
+      || typeof admitted != "integer" || admitted < 0 || admitted > produced) return false;
+  local key = OpexEB14JournalUnitKey(unit.kind, unit.cargo, unit.low, unit.high);
+  if (key == null) return false;
+  local rev = [];
+  foreach (field in ["towns", "industries", "lines", "engines_rail", "engines_road",
+                     "engines_air", "engines_water"]) {
+    if (!(field in snapshot) || typeof snapshot[field] != "integer"
+        || snapshot[field] < 0) return false;
+    rev.append(snapshot[field]);
+  }
+  if (EB14_RAIL_JOURNAL_STATE == null) EB14_RAIL_JOURNAL_STATE = OpexEB14JournalNew();
+  local journal = EB14_RAIL_JOURNAL_STATE;
+  if (!(key in journal.observed) && journal.observed.len() >= EB14_RAIL_JOURNAL_MAX_UNITS) {
+    if (journal.dropped < 2147483647) journal.dropped++;
+    return false;
+  }
+  local prior = key in journal.observed ? journal.observed[key] : null;
+  local count = prior == null ? 1
+      : (prior.scans >= 2147483647 ? 2147483647 : prior.scans + 1);
+  journal.observed.rawset(key, { kind = unit.kind, cargo = unit.cargo,
+      low = unit.low, high = unit.high, date = AIDate.GetCurrentDate(),
+      produced = produced, admitted = admitted, scans = count, revisions = rev });
+  return true;
+}
+
+/* Load() precedes OpexLoadSettings() and forbids world checks. Strictly
+ * validate/copy the complete primitive graph here; reject malformed saves
+ * atomically and let PO01C regenerate from scratch. */
+function OpexEB14JournalDecode(data)
+{
+  if (data == null || typeof data != "table"
+      || !("version" in data) || data.version != EB14_RAIL_JOURNAL_VERSION
+      || !("diagnosticOnly" in data) || data.diagnosticOnly != true
+      || !("observed" in data) || typeof data.observed != "table"
+      || data.observed.len() > EB14_RAIL_JOURNAL_MAX_UNITS
+      || !("dropped" in data) || typeof data.dropped != "integer"
+      || data.dropped < 0) return null;
+  local journal = OpexEB14JournalNew();
+  journal.dropped = data.dropped;
+  foreach (key, row in data.observed) {
+    if (typeof key != "string" || key.len() > EB14_RAIL_JOURNAL_MAX_KEY
+        || typeof row != "table") return null;
+    foreach (field in ["kind", "cargo", "low", "high", "date", "produced",
+                       "admitted", "scans", "revisions"])
+      if (!(field in row)) return null;
+    if (OpexEB14JournalUnitKey(row.kind, row.cargo, row.low, row.high) != key
+        || typeof row.date != "integer" || row.date < 0
+        || typeof row.produced != "integer" || row.produced < 0
+        || typeof row.admitted != "integer" || row.admitted < 0
+        || row.admitted > row.produced
+        || typeof row.scans != "integer" || row.scans < 1
+        || typeof row.revisions != "array" || row.revisions.len() != 7) return null;
+    local copyRev = [];
+    foreach (revision in row.revisions) {
+      if (typeof revision != "integer" || revision < 0) return null;
+      copyRev.append(revision);
+    }
+    journal.observed.rawset(key, { kind = row.kind, cargo = row.cargo,
+        low = row.low, high = row.high, date = row.date,
+        produced = row.produced, admitted = row.admitted, scans = row.scans,
+        revisions = copyRev });
+  }
+  return journal;
+}
+
+function OpexAI::_reconcileEB14JournalAfterLoad()
+{
+  local raw = EB14_RAIL_JOURNAL_RELOAD;
+  EB14_RAIL_JOURNAL_RELOAD = null;
+  if (!EB14_PROGRESSIVE) {
+    EB14_RAIL_JOURNAL_STATE = null;
+    return;
+  }
+  EB14_RAIL_JOURNAL_STATE = OpexEB14JournalDecode(raw);
+  if (EB14_RAIL_JOURNAL_STATE == null) EB14_RAIL_JOURNAL_STATE = OpexEB14JournalNew();
+  /* No published project/ticket is recovered by this schema. All rail units
+   * remain due; the historical PO01C/C76 reload reconstruction stays enabled. */
+  if (DECISION_LOG) OpexDecide("EB14_RELOAD",
+      "journal_units=" + EB14_RAIL_JOURNAL_STATE.observed.len()
+      + " dropped=" + EB14_RAIL_JOURNAL_STATE.dropped + " replay_required=1");
+}
+
+function OpexAI::Save()
+{
+  if (PO01C_REGEN_SPLIT && DECISION_LOG && this._po01cJob != null)
+    OpexPO01CLog(this, this._po01cJob, "save_pending");
+  local startOps = null;
+  if (DECISION_LOG) startOps = AIController.GetOpsTillSuspend();
+
+  /* A 0, conserver exactement le format historique : la charge complete est experimentale et
+   * le serialiseur execute Save() sous budget d'opcodes. _abandonedPairs ne contient que des
+   * cles chaine -> { date, count } entiers : le rendre directement conserve exactement le meme
+   * graphe serialisable sans recopier potentiellement des milliers d'entrees en Squirrel avant
+   * le retour. Load() reconstruit deja sa propre table, donc aucune alias mutable ne survit au
+   * rechargement. */
+  if (!SAVE_FULL_STATE && RS_JOURNAL.len() == 0) {
+    local shortSave = {
+      version = 1,
+      generationStage = this._generationStage,
+      generationStageMonth = this._generationStageMonth,
+      lastFreightCargo = this._lastFreightCargo,
+      bootstrapFreightCargo = this._bootstrapFreightCargo,
+      nextLineId = this._nextLineId,
+      lastCatalogMonth = this._lastCatalogMonth,
+      lastReportYear = this._lastReportYear,
+      startYear = this._startYear,
+      abandonedPairs = this._abandonedPairs != null ? this._abandonedPairs : {},
+      airBuilt = this._airBuilt,
+      waterBuilt = this._waterBuilt,
+    };
+    if (OpexRailRepairAnyOptIn())
+      shortSave.railRepairLastConstructionDate <- RAIL_REPAIR_LAST_CONSTRUCTION_DATE;
+    {
+      shortSave.c76Revisions <- this._c76SaveRevisions();
+    }
+    if (V250_RIGHTS != 0) OpexSaveV250(shortSave, this);
+    if (N75_MULTI_CARGO > 0) shortSave.n75McLastMonth <- N75_MC_LAST_MONTH;
+    if (INVEST_STALL) shortSave.investStallLastMonth <- INVEST_STALL_LAST_MONTH;
+    if (OpexC121StrategyStateEnabled()) OpexSaveC121Strategy(shortSave);
+    if (OPEX_AIR_ROLLBACKS.len() > 0) shortSave.airRollbacks <- OPEX_AIR_ROLLBACKS;
+    if (V259_BRIDGE_RENEW != 0) {
+      shortSave.v259KnownBridgesCount <- this._v259KnownBridgesCount;
+      shortSave.v259Cursor <- this._v259Cursor;
+      shortSave.v259Queue <- OpexV259SaveQueue(this._v259Queue);
+    }
+    if (this._v292LastHqTryYear >= 0) shortSave.v292LastHqTryYear <- this._v292LastHqTryYear;
+    if (ROAD100_LONG_SHADOW_YEAR >= 0) shortSave.road100LongShadowYear <- ROAD100_LONG_SHADOW_YEAR;
+    if (EB14_PROGRESSIVE && EB14_RAIL_JOURNAL_STATE != null)
+      shortSave.eb14RailJournal <- EB14_RAIL_JOURNAL_STATE;
+    if (PO02_INDEPENDENT_EXPIRY) {
+      shortSave.po02LastPublishDate <- PO02_LAST_PUBLISH_DATE;
+      if (PO02_INDEPENDENT_EXPIRY >= 2) shortSave.po02DeferSince <- PO02_DEFER_SINCE;
+    }
+    shortSave.eb7Ledger <- EB7_LEDGER;
+    if (DECISION_LOG && startOps != null) {
+      local endOps = AIController.GetOpsTillSuspend();
+      local opsSpent = startOps - endOps;
+      if (opsSpent < 0) opsSpent = 0;
+      local lCount = (this._lines != null) ? this._lines.len() : 0;
+      local aCount = (this._abandonedPairs != null) ? this._abandonedPairs.len() : 0;
+      local hCount = (this._abandonCounts != null) ? this._abandonCounts.len() : 0;
+      local tCount = (this._taskQueue != null) ? this._taskQueue.len() : 0;
+      OpexDecide("V262_SAVE", "ops=" + opsSpent + " budget=100000 lines=" + lCount + " abandons=" + aCount + " abandonCounts=" + hCount + " tasks=" + tCount + " full=0");
+    }
+    return shortSave;
+  }
+
+  local abandoned = {};
+  if (this._abandonedPairs != null) {
+    foreach (key, val in this._abandonedPairs) abandoned[key] <- val;
+  }
+
+  local taskDue = {};
+  if (this._taskQueue != null) {
+    foreach (task in this._taskQueue) taskDue[task.name] <- task.dueCycle;
+  }
+  /* Certains modeles economiques (surtout air) laissent des flottants dans des metriques
+   * predites, type que le format de sauvegarde OpenTTD refuse. Toujours projeter chaque ligne
+   * en UN SEUL passage : l'ancien probe "faut-il projeter ?" reparcourait ensuite presque toutes
+   * les lignes et finissait par epuiser le budget de 100k opcodes de Save() sur les grosses
+   * flottes. Les champs scalarises restants sont serialisables; les tableaux (VehicleID) et
+   * tables des lignes actuelles ne contiennent que des entiers/booleens/null. */
+  local saveLines = this._lines;
+  if (this._lines != null) {
+    /* Les lignes deja projetees par _refreshSaveProjection sont reprises telles
+     * quelles : Save() ne fait plus qu'une recherche par ligne. Seules les lignes
+     * apparues depuis le dernier passage sont projetees ici. */
+    local cache = this._saveProjection;
+    local projectedLines = [];
+    foreach (line in this._lines) {
+      if (line == null || typeof line != "table") {
+        projectedLines.append(line);
+        continue;
+      }
+      if (cache != null && (line in cache)) {
+        projectedLines.append(cache[line]);
+        continue;
+      }
+      projectedLines.append(OpexSaveProjectLine(line));
+    }
+    saveLines = projectedLines;
+  }
+  local saveObj = {
+    version = 1,
+    /* C69/C75 : sans ces dates, tau repart de 0 chantier sur une fenetre de 365 jours et K_dec /
+     * K_pass explosent pendant un an apres chargement (docs/19_rechargement_partie.md). Entiers. */
+    c69BuildDates = C69_BUILD_DATES,
+    c75PassDates = C75_PASS_DATES,
+    generationStage = this._generationStage,
+    generationStageMonth = this._generationStageMonth,
+    lastFreightCargo = this._lastFreightCargo,
+    bootstrapFreightCargo = this._bootstrapFreightCargo,
+    nextLineId = this._nextLineId,
+    lastCatalogMonth = this._lastCatalogMonth,
+    lastReportYear = this._lastReportYear,
+    startYear = this._startYear,
+    abandonedPairs = abandoned,
+    airBuilt = this._airBuilt,
+    waterBuilt = this._waterBuilt,
+    lines = saveLines,
+    abandonCounts = this._abandonCounts,
+    lastRepayMonth = this._lastRepayMonth,
+    taskCycle = this._taskCycle,
+    taskCursor = this._taskCursor,
+    vehiclesToRetire = this._vehiclesToRetire,
+    unprofitableStreaks = this._unprofitableStreaks,
+    activeSubsidies = this._activeSubsidies,
+    taskDue = taskDue,
+    railExpansion = OpexSaveRailExpansion(this._railExpansion),
+    railSearchPending = this._railSearch != null,
+    c41RailSignalLines = OpexCopyBoolTable(this._c41RailSignalLines),
+    c41RailJunctionLines = OpexCopyBoolTable(this._c41RailJunctionLines),
+    stateVersion = 2,
+  };
+  if (OpexRailRepairAnyOptIn())
+    saveObj.railRepairLastConstructionDate <- RAIL_REPAIR_LAST_CONSTRUCTION_DATE;
+  saveObj.c80ReactiveQueue <- OpexSaveReactiveQueue(this._reactiveQueue);
+  if (RS_JOURNAL.len() > 0) saveObj.railSidingsRuntime <- RS_JOURNAL;
+  saveObj.c80ActiveWorker <- OpexSaveActiveWorker(this._activeWorker);
+  {
+    saveObj.c76Revisions <- this._c76SaveRevisions();
+  }
+  if (V250_RIGHTS != 0) OpexSaveV250(saveObj, this);
+  if (N75_MULTI_CARGO > 0) saveObj.n75McLastMonth <- N75_MC_LAST_MONTH;
+  if (INVEST_STALL) saveObj.investStallLastMonth <- INVEST_STALL_LAST_MONTH;
+
+  /* Hors projection mensuelle : la transaction et le curseur doivent etre exacts. */
+  saveObj.v257RailRefresh <- { cursor = this._v257Cursor, state = this._v257State,
+    pending = this._v257Pending, engineRevision = this._v257EngineRevision,
+    priorityRemaining = this._v257PriorityRemaining };
+  if (V284_RAIL_GROWTH > 0 || V233_LONG_GOOD > 0
+      || (INVEST_STALL && this._v284State != null)
+      || OpexInvestStallPending(this) || OpexRailLongV2FleetPending(this))
+    saveObj.v284Growth <- this._v284State;
+  if (this._railLongV2Pending != null)
+    saveObj.railLongV2Upgrade <- this._railLongV2Pending;
+  if (V233_LONG_GOOD > 0) saveObj.v233LongGood <- V233L_STATE;
+
+  if (OpexC121StrategyStateEnabled()) OpexSaveC121Strategy(saveObj);
+  if (OPEX_AIR_ROLLBACKS.len() > 0) saveObj.airRollbacks <- OPEX_AIR_ROLLBACKS;
+  if (V259_BRIDGE_RENEW != 0) {
+    saveObj.v259KnownBridgesCount <- this._v259KnownBridgesCount;
+    saveObj.v259Cursor <- this._v259Cursor;
+    saveObj.v259Queue <- OpexV259SaveQueue(this._v259Queue);
+  }
+  if (this._v292LastHqTryYear >= 0) saveObj.v292LastHqTryYear <- this._v292LastHqTryYear;
+  if (ROAD100_LONG_SHADOW_YEAR >= 0) saveObj.road100LongShadowYear <- ROAD100_LONG_SHADOW_YEAR;
+  if (EB14_PROGRESSIVE && EB14_RAIL_JOURNAL_STATE != null)
+    saveObj.eb14RailJournal <- EB14_RAIL_JOURNAL_STATE;
+  /* Meme cle que le short save. Au defaut 0 la branche est fausse. */
+  if (PO02_INDEPENDENT_EXPIRY)
+    saveObj.po02LastPublishDate <- PO02_LAST_PUBLISH_DATE;
+  if (PO02_INDEPENDENT_EXPIRY >= 2) saveObj.po02DeferSince <- PO02_DEFER_SINCE;
+  if (DECISION_LOG && startOps != null) {
+    local endOps = AIController.GetOpsTillSuspend();
+    local opsSpent = startOps - endOps;
+    if (opsSpent < 0) opsSpent = 0;
+    local lCount = (this._lines != null) ? this._lines.len() : 0;
+    local aCount = (this._abandonedPairs != null) ? this._abandonedPairs.len() : 0;
+    local hCount = (this._abandonCounts != null) ? this._abandonCounts.len() : 0;
+    local tCount = (this._taskQueue != null) ? this._taskQueue.len() : 0;
+    OpexDecide("V262_SAVE", "ops=" + opsSpent + " budget=100000 lines=" + lCount + " abandons=" + aCount + " abandonCounts=" + hCount + " tasks=" + tCount + " full=1");
+  }
+  return saveObj;
+}
+function OpexAI::Load(version, data)
+{
+  /* Load s'execute avant lecture des settings : lire le scalaire meme si
+   * l'option est changee apres sauvegarde. Absence = cooldown prudent. */
+  RAIL_REPAIR_LAST_CONSTRUCTION_DATE = -1;
+  if (data != null && ("railRepairLastConstructionDate" in data)
+      && typeof data.railRepairLastConstructionDate == "integer"
+      && data.railRepairLastConstructionDate >= 0)
+    RAIL_REPAIR_LAST_CONSTRUCTION_DATE = data.railRepairLastConstructionDate;
+  OpexRSLoad(data);
+  /* MULTI-1 SHADOW transactions are diagnostic only and cannot survive Load. */
+  MULTI1_ROAD_CARGO_PENDING = null;
+  MULTI1_ROAD_CARGO_LAST_MONTH = -1;
+  V233L_STATE = null;
+  this._v233LReload = null;
+  this._po01cJob = null;
+  this._po01cPending = false;
+  this._po01cLineState = null;
+  this._po01cLastTick = -1;
+  ROAD100_LONG_SHADOW_YEAR = -1;
+  EB14_RAIL_JOURNAL_STATE = null;
+  /* Settings are not loaded yet: defer EB-14 ON/OFF decision until Start(). */
+  EB14_RAIL_JOURNAL_RELOAD = data != null && ("eb14RailJournal" in data)
+      ? data.eb14RailJournal : null;
+  V276_CATALOG_TASK = null;
+  if (this._taskQueue != null) foreach (task in this._taskQueue) {
+    if ("v276" in task) delete task.v276;
+    if ("v276Request" in task) delete task.v276Request;
+    if ("v276Rail" in task) delete task.v276Rail;
+    if ("v276Road" in task) delete task.v276Road;
+    if ("v276Batches" in task) delete task.v276Batches;
+  }
+  this._loadedFromSave = true;
+  N75_MC_SAVED_MONTH = -1;
+  INVEST_STALL_SAVED_MONTH = -1;
+  OPEX_RELOAD_C121_STRATEGY = null;
+  OPEX_AIR_ROLLBACKS = [];
+  PO02_DEFER_SINCE = { road = 0, water = 0, fleet = 0 };
+  PO02_RETRY = null;
+  if (data == null) return;
+  if (("v233LongGood" in data) && typeof data.v233LongGood == "table")
+    this._v233LReload = data.v233LongGood;
+  if (("n75McLastMonth" in data) && typeof data.n75McLastMonth == "integer")
+    N75_MC_SAVED_MONTH = data.n75McLastMonth;
+  if (("investStallLastMonth" in data) && typeof data.investStallLastMonth == "integer")
+    INVEST_STALL_SAVED_MONTH = data.investStallLastMonth;
+  if ("airRollbacks" in data) OPEX_AIR_ROLLBACKS = OpexLoadAirRollbacks(data.airRollbacks);
+  if ("c121Strategy" in data) OPEX_RELOAD_C121_STRATEGY = OpexLoadC121Strategy(data.c121Strategy);
+  this._reloadC69BuildDates = ("c69BuildDates" in data) ? data.c69BuildDates : null;
+  this._reloadC75PassDates = ("c75PassDates" in data) ? data.c75PassDates : null;
+  if ("generationStage" in data) this._generationStage = data.generationStage;
+  if ("generationStageMonth" in data) this._generationStageMonth = data.generationStageMonth;
+  if ("lastFreightCargo" in data) this._lastFreightCargo = data.lastFreightCargo;
+  if ("bootstrapFreightCargo" in data) this._bootstrapFreightCargo = data.bootstrapFreightCargo;
+  if ("nextLineId" in data) this._nextLineId = data.nextLineId;
+  if ("lastCatalogMonth" in data) this._lastCatalogMonth = data.lastCatalogMonth;
+  if ("lastReportYear" in data) this._lastReportYear = data.lastReportYear;
+  if ("startYear" in data) this._startYear = data.startYear;
+  if ("airBuilt" in data) this._airBuilt = data.airBuilt;
+  if ("waterBuilt" in data) this._waterBuilt = data.waterBuilt;
+  if ("abandonedPairs" in data && data.abandonedPairs != null) {
+    this._abandonedPairs = {};
+    foreach (key, val in data.abandonedPairs) this._abandonedPairs[key] <- val;
+  }
+  if ("lines" in data) this._pendingLines = data.lines;
+  /* Load precede OpexLoadSettings : ne pas gater sur PO02_INDEPENDENT_EXPIRY,
+   * encore a 0 ici. Copier les cinq slots pour qu'une sauvegarde sans fleet
+   * ne reintroduise pas l'index manquant. */
+  if (("po02LastPublishDate" in data) && typeof data.po02LastPublishDate == "table") {
+    local src = data.po02LastPublishDate;
+    local restored = { air = 0, rail = 0, road = 0, water = 0, fleet = 0 };
+    if (("air" in src) && typeof src.air == "integer") restored.air = src.air;
+    if (("rail" in src) && typeof src.rail == "integer") restored.rail = src.rail;
+    if (("road" in src) && typeof src.road == "integer") restored.road = src.road;
+    if (("water" in src) && typeof src.water == "integer") restored.water = src.water;
+    if (("fleet" in src) && typeof src.fleet == "integer") restored.fleet = src.fleet;
+    PO02_LAST_PUBLISH_DATE = restored;
+  }
+  // Load runs before settings; accept only known, non-negative integer dates.
+  if (("po02DeferSince" in data) && typeof data.po02DeferSince == "table") {
+    foreach (mode in ["road", "water", "fleet"]) {
+      if ((mode in data.po02DeferSince) && typeof data.po02DeferSince[mode] == "integer"
+          && data.po02DeferSince[mode] >= 0) PO02_DEFER_SINCE[mode] = data.po02DeferSince[mode];
+    }
+  }
+  if (("eb7Ledger" in data) && typeof data.eb7Ledger == "table")
+    EB7_LEDGER = data.eb7Ledger;
+  /* Load s'execute avant les reglages : restaurer la transaction physique
+   * d'agrandissement de quais (moteur partage avec INVEST-STALL). */
+  if (("railLongV2Upgrade" in data) && typeof data.railLongV2Upgrade == "table")
+    this._railLongV2Pending = data.railLongV2Upgrade;
+  if ("abandonCounts" in data && data.abandonCounts != null) this._abandonCounts = data.abandonCounts;
+  if ("lastRepayMonth" in data) this._lastRepayMonth = data.lastRepayMonth;
+  if ("taskCycle" in data) this._taskCycle = data.taskCycle;
+  if ("taskCursor" in data) this._taskCursor = data.taskCursor;
+  if ("v257RailRefresh" in data && typeof data.v257RailRefresh == "table") {
+    local railRefresh = data.v257RailRefresh;
+    this._v257Cursor = ("cursor" in railRefresh && typeof railRefresh.cursor == "integer") ? railRefresh.cursor : 0;
+    this._v257State = ("state" in railRefresh && typeof railRefresh.state == "table") ? railRefresh.state : null;
+    this._v257Pending = ("pending" in railRefresh && typeof railRefresh.pending == "table") ? railRefresh.pending : null;
+    this._v257EngineRevision = ("engineRevision" in railRefresh) ? railRefresh.engineRevision : -1;
+    this._v257PriorityRemaining = ("priorityRemaining" in railRefresh) ? railRefresh.priorityRemaining : 0;
+  }
+  if ("vehiclesToRetire" in data && data.vehiclesToRetire != null) this._vehiclesToRetire = data.vehiclesToRetire;
+  if ("unprofitableStreaks" in data && data.unprofitableStreaks != null) this._unprofitableStreaks = data.unprofitableStreaks;
+  if ("activeSubsidies" in data && data.activeSubsidies != null) this._activeSubsidies = data.activeSubsidies;
+  /* 11.6/11.7 : aucune lecture du monde ici. Les validations VehicleID/LineID attendent
+   * _reconcileAfterLoad(), appele depuis Start() apres OpexLoadSettings(). Les sauvegardes
+   * stateVersion=1 n'ont simplement pas ces champs et gardent les valeurs constructeur. */
+  if ("railExpansion" in data) this._railExpansion = OpexLoadRailExpansion(data.railExpansion);
+  /* Load precede OpexLoadSettings : ne pas tester la globale encore a 0 ici. */
+  if (("v284Growth" in data) && typeof data.v284Growth == "table")
+    this._v284State = data.v284Growth;
+  this._reloadDroppedRailSearch = ("railSearchPending" in data) && data.railSearchPending;
+  if (("dynamicBatchPending" in data) && data.dynamicBatchPending) {
+    this._projects = null;
+    this._ranked = null;
+    this._portfolioInvalidated = true;
+  }
+  if ("c41RailSignalLines" in data && data.c41RailSignalLines != null) {
+    this._c41RailSignalLines = OpexCopyBoolTable(data.c41RailSignalLines);
+  }
+  if ("c41RailJunctionLines" in data && data.c41RailJunctionLines != null) {
+    this._c41RailJunctionLines = OpexCopyBoolTable(data.c41RailJunctionLines);
+  }
+  /* Cle par nom : l'ordre de la file peut evoluer entre deux versions de l'IA. */
+  if ("taskDue" in data && data.taskDue != null && this._taskQueue != null) {
+    foreach (task in this._taskQueue) {
+      if (task.name in data.taskDue) task.dueCycle = data.taskDue[task.name];
+    }
+  }
+  /* Load() precede OpexLoadSettings() : ne jamais conditionner la restauration
+   * C80/C76 aux drapeaux runtime, encore a leurs valeurs globales false ici. */
+  if ("c80ReactiveQueue" in data && data.c80ReactiveQueue != null) {
+    this._reactiveQueue = OpexLoadReactiveQueue(data.c80ReactiveQueue);
+  }
+  if ("c80ActiveWorker" in data && data.c80ActiveWorker != null) {
+    this._activeWorker = OpexLoadActiveWorker(data.c80ActiveWorker);
+  }
+  if ("c76Revisions" in data && data.c76Revisions != null) {
+    this._c76LoadRevisions(data.c76Revisions);
+  }
+  if ("v250Targets" in data) this._reloadV250Targets = data.v250Targets;
+  if ("v250Freed" in data) this._reloadV250Freed = data.v250Freed;
+  if ("v259KnownBridgesCount" in data) this._reloadV259KnownBridgesCount = data.v259KnownBridgesCount;
+  if ("v259Cursor" in data) this._reloadV259Cursor = data.v259Cursor;
+  if ("v259Queue" in data) this._reloadV259Queue = data.v259Queue;
+  this._v292LastHqTryYear = ("v292LastHqTryYear" in data) ? data.v292LastHqTryYear : -1;
+  ROAD100_LONG_SHADOW_YEAR = ("road100LongShadowYear" in data && typeof data.road100LongShadowYear == "integer")
+      ? data.road100LongShadowYear : -1;
+  /* C80 etape 2 : memoire transitoire du seuil de selection du stock rail, remise a 0 au rechargement. */
+  this._railStockLastFundedScore = 0.0;
+  this._railStockLastFundedDate = -1;
+}
+/* Load tourne trop tot et sous DisableDoCommandScope : la verification du monde est donc faite
+ * ici, apres les reglages. Les stationA/stationB sont des TUILES, jamais des StationID. */
+function OpexAI::_reconcileAfterLoad()
+{
+  /* R20 : appliquer seulement apres OpexLoadSettings, qui efface la pression. */
+  OpexRestoreC121Strategy(OPEX_RELOAD_C121_STRATEGY);
+  OPEX_RELOAD_C121_STRATEGY = null;
+  OpexAirReconcileRollbacks();
+  /* C69/C75/C70 : restaurer APRES OpexLoadSettings() et les remises a zero de Start(). */
+  if (this._reloadC69BuildDates != null && typeof this._reloadC69BuildDates == "array") {
+    C69_BUILD_DATES = this._reloadC69BuildDates;
+  }
+  if (this._reloadC75PassDates != null && typeof this._reloadC75PassDates == "array") {
+    C75_PASS_DATES = this._reloadC75PassDates;
+  }
+  if (V250_RIGHTS != 0) {
+    if (this._reloadV250Targets != null && typeof this._reloadV250Targets == "table") {
+      this._v250Targets = {};
+      foreach (townId, mark in this._reloadV250Targets) this._v250Targets.rawset(townId, typeof mark == "integer" ? mark : 1);
+    }
+    if (this._reloadV250Freed != null && typeof this._reloadV250Freed == "table") {
+      this._v250Freed = {};
+      foreach (townId, mark in this._reloadV250Freed) this._v250Freed.rawset(townId, 1);
+    }
+  }
+  this._reloadV250Targets = null;
+  this._reloadV250Freed = null;
+  this._reloadC69BuildDates = null;
+  this._reloadC75PassDates = null;
+
+  local saved = 0;
+  local kept = 0;
+  local dropped = 0;
+  local purgedVehicles = 0;
+  local liveLines = [];
+  if (this._pendingLines != null) {
+    if (typeof this._pendingLines != "array") {
+      AILog.Warning("OpexAI: loaded lines is not an array (got " + typeof this._pendingLines + "), ignoring.");
+    } else {
+      foreach (line in this._pendingLines) {
+        saved++;
+        if (typeof line != "table") {
+          dropped++;
+          AILog.Warning("OpexAI: invalid line entry in savegame (expected table, got " + typeof line + "), skipping.");
+          continue;
+        }
+        if (!("stationA" in line) || !("stationB" in line) ||
+            !AIMap.IsValidTile(line.stationA) || !AIMap.IsValidTile(line.stationB)) {
+          dropped++;
+          continue;
+        }
+      local stationA = AIStation.GetStationID(line.stationA);
+      local stationB = AIStation.GetStationID(line.stationB);
+      if (!AIStation.IsValidStation(stationA) || !AIStation.IsValidStation(stationB) ||
+          !AICompany.IsMine(AITile.GetOwner(line.stationA)) ||
+          !AICompany.IsMine(AITile.GetOwner(line.stationB))) {
+        dropped++;
+        continue;
+      }
+      /* ROAD100-14 : les deux terminus historiques valides suffisent pour
+       * conserver la ligne. Un arret A1 disparu, corrompu ou joint a une
+       * ancienne gare ne doit PAS faire perdre la ligne ni provoquer des
+       * commandes monde pendant la reconciliation. task_road effectuera la
+       * reparation des ordres plus tard, hors Load. Chemin sans tour intact. */
+      if (("mode" in line) && line.mode == "road" &&
+          ("kind" in line) && line.kind == "pax" &&
+          ("road100TourActive" in line) && line.road100TourActive) {
+        local tourValid = ("road100TourStops" in line) &&
+            typeof line.road100TourStops == "array" &&
+            line.road100TourStops.len() == 4;
+        local tourReason = "SHAPE";
+        if (tourValid) {
+          foreach (tourTile in line.road100TourStops) {
+            if (typeof tourTile != "integer") {
+              tourValid = false;
+              tourReason = "TYPE";
+              break;
+            }
+          }
+        }
+        if (tourValid && (line.road100TourStops[0] != line.stationA ||
+            line.road100TourStops[1] != line.stationB ||
+            line.road100TourStops[3] != line.stationB ||
+            line.road100TourStops[2] == line.stationA ||
+            line.road100TourStops[2] == line.stationB)) {
+          tourValid = false;
+          tourReason = "ORDERS";
+        }
+        if (tourValid) {
+          local tourTileA1 = line.road100TourStops[2];
+          if (!AIMap.IsValidTile(tourTileA1) ||
+              !AIRoad.IsRoadStationTile(tourTileA1)) {
+            tourValid = false;
+            tourReason = "TILE";
+          } else {
+            local tourStationA1 = AIStation.GetStationID(tourTileA1);
+            if (!AIStation.IsValidStation(tourStationA1) ||
+                tourStationA1 == stationA || tourStationA1 == stationB ||
+                !AICompany.IsMine(AITile.GetOwner(tourTileA1))) {
+              tourValid = false;
+              tourReason = "STATION";
+            }
+          }
+        }
+        if ("road100TourNeedsRepair" in line) line.road100TourNeedsRepair = !tourValid;
+        else line.road100TourNeedsRepair <- !tourValid;
+        if (!tourValid && DECISION_LOG) {
+          OpexDecide("ROAD100_TOUR", "phase=load_repair line=" +
+              (("lineId" in line) ? line.lineId : -1) +
+              " reason=" + tourReason);
+        }
+      }
+      /* ROAD100-20 : reconciliation des satellites PORTFOLIO au chargement.
+       * Si un quai satellite a ete detruit hors jeu, recalculer nStopsA/B
+       * et nettoyer la liste des tuiles pour ne laisser aucun plafond fantome. */
+      if (("mode" in line) && line.mode == "road" &&
+          ("road100PaxPortfolio" in line) &&
+          line.road100PaxPortfolio != null) {
+        local portValid = typeof line.road100PaxPortfolio == "table";
+        if (!portValid) {
+          line.nStopsA = 1;
+          line.nStopsB = 1;
+          line.road100PaxPortfolio = null;
+        } else {
+          local port = line.road100PaxPortfolio;
+          local roots = [line.stationA, line.stationB];
+          local ids = [
+            ("stationA" in port && port.stationA != null) ? port.stationA : stationA,
+            ("stationB" in port && port.stationB != null) ? port.stationB : stationB
+          ];
+          local stopsArrays = [
+            ("stopsA" in port && typeof port.stopsA == "array") ? port.stopsA : null,
+            ("stopsB" in port && typeof port.stopsB == "array") ? port.stopsB : null
+          ];
+          for (local side = 0; side < 2; side++) {
+            local root = roots[side];
+            local rootId = ids[side];
+            local rootOk = typeof root == "integer" && AIMap.IsValidTile(root)
+                && AIRoad.IsRoadStationTile(root)
+                && AICompany.IsMine(AITile.GetOwner(root))
+                && rootId >= 0 && AIStation.IsValidStation(rootId)
+                && AIStation.GetStationID(root) == rootId;
+            local remaining = [];
+            if (rootOk && stopsArrays[side] != null) {
+              foreach (sat in stopsArrays[side]) {
+                if (typeof sat == "integer" && AIMap.IsValidTile(sat)
+                    && AIRoad.IsRoadStationTile(sat)
+                    && AICompany.IsMine(AITile.GetOwner(sat))
+                    && AIStation.GetStationID(sat) == rootId) {
+                  remaining.append(sat);
+                }
+              }
+            }
+            if (side == 0) {
+              port.stopsA = remaining;
+              line.nStopsA = 1 + remaining.len();
+            } else {
+              port.stopsB = remaining;
+              line.nStopsB = 1 + remaining.len();
+            }
+          }
+        }
+      }
+      /* Les camions sont identifies par leurs ordres : ne pas reecrire le champ vehicles d'une
+       * ligne route, meme si une ancienne version l'a laisse dans la table. */
+      if ((!("mode" in line) || line.mode != "road") && ("vehicles" in line) && line.vehicles != null) {
+        local liveVehicles = [];
+        foreach (vehicle in line.vehicles) {
+          if (AIVehicle.IsValidVehicle(vehicle)) liveVehicles.append(vehicle);
+          else purgedVehicles++;
+        }
+        line.vehicles = liveVehicles;
+      }
+      /* Les sauvegardes anterieures a C52 ne portent pas le moteur de secours.
+       * Tant qu'un appareil/navire vit encore, migrer cette metadonnee ici pour
+       * qu'un prochain crash puisse etre reconstruit sans template. */
+      if ((("mode" in line) && (line.mode == "air" || line.mode == "water")) &&
+          !(("refleetEngine" in line) && line.refleetEngine >= 0)) {
+        local template = null;
+        if (("vehicles" in line) && line.vehicles != null) {
+          foreach (vehicle in line.vehicles) {
+            if (AIVehicle.IsValidVehicle(vehicle)) { template = vehicle; break; }
+          }
+        }
+        if (template == null && ("vehicle" in line) && AIVehicle.IsValidVehicle(line.vehicle)) {
+          template = line.vehicle;
+        }
+        if (template != null) line.refleetEngine <- AIVehicle.GetEngineType(template);
+      }
+      /* ROAD1Y mail_pax: clone in OpexSaveProjectLine already keeps kind,
+       * parentLineId, mailChildLineId and road1yMailTryMonth. Old saves omit them. */
+      if (("mode" in line) && line.mode == "road") {
+        if (!("parentLineId" in line)) line.parentLineId <- -1;
+        if (!("mailChildLineId" in line)) line.mailChildLineId <- -1;
+        if (!("road1yMailTryMonth" in line)) line.road1yMailTryMonth <- -1;
+      }
+      liveLines.append(line);
+      kept++;
+    }
+  }
+  }
+  /* Load precede OpexLoadSettings : notifier les revisions V279 ici apres OpexLoadSettings(). */
+  this._lines = liveLines;
+  if (V279_RESELECT_MEMO != 0) OPEX_LINES_REVISION++;
+  if (V279_RESELECT_MEMO != 0) OPEX_ABANDON_REVISION++;
+  if (V279_RESELECT_MEMO != 0) OPEX_AIR_ROLLBACK_REVISION++;
+  if (RS_JOURNAL.len() > 0) { OpexRSReconcile(this); RS_RELOADED = false; }
+  this._reconcileEB14JournalAfterLoad();
+  OpexV257Reconcile(this);
+  if (this._railLongV2Pending != null) OpexRailLongV2Reconcile(this);
+  /* During invalid SIDINGS identity HOLD, even V284 Load reconciliation
+   * must not adopt, roll back, or schedule a vehicle disposal. */
+  if (!RS_LEGACY_HOLD && (V284_RAIL_GROWTH > 0 || V233_LONG_GOOD > 0 || (INVEST_STALL && this._v284State != null)
+      || OpexInvestStallPending(this) || OpexRailLongV2FleetPending(this)))
+    OpexV284Reconcile(this);
+  if (V233_LONG_GOOD > 0) OpexV233LReconcile(this);
+  this._pendingLines = null;
+  /* C70 : recalcul des facteurs APRES la reconstitution de this._lines. Appele plus haut, il
+   * tournait sur la liste encore vide et remettait tous les facteurs a 1 (mesure 2026-09-22). */
+  OpexC70RecomputeFactors(this._lines);
+  OpexC121RecomputeRealizationFactors(this._lines);
+  if ((ESTIM_UNIFIE & 17) != 0) OpexEstimRecomputeRevenueFactors(this._lines);
+
+  local selfComp = AICompany.ResolveCompanyID(AICompany.COMPANY_SELF);
+  foreach (line in this._lines) {
+    if (line == null || typeof line != "table") continue;
+    if (!("bridges" in line) || line.bridges == null || typeof line.bridges != "array") {
+      line.bridges <- [];
+    } else {
+      local liveBridges = [];
+      foreach (b in line.bridges) {
+        if (b != null && typeof b == "table" && ("start" in b) && ("end" in b) &&
+            AIBridge.IsBridgeTile(b.start) && AIBridge.GetOtherBridgeEnd(b.start) == b.end &&
+            AITile.GetOwner(b.start) == selfComp) {
+          liveBridges.append(b);
+        }
+      }
+      line.bridges = liveBridges;
+    }
+  }
+
+  if (V259_BRIDGE_RENEW != 0) {
+    if (this._reloadV259KnownBridgesCount != null) this._v259KnownBridgesCount = this._reloadV259KnownBridgesCount;
+    if (this._reloadV259Cursor != null) this._v259Cursor = this._reloadV259Cursor;
+    if (this._reloadV259Queue != null) {
+      this._v259Queue = OpexV259LoadQueue(this._reloadV259Queue, this._lines);
+    }
+  }
+  this._reloadV259KnownBridgesCount = null;
+  this._reloadV259Cursor = null;
+  this._reloadV259Queue = null;
+
+  local railExpansion = this._reconcileRailExpansionAfterLoad();
+
+  /* _railSearch contient un pathfinder/segmented search vivant, qui n'est pas persiste.
+   * Si Save() l'a vu actif, abandon explicite puis reconstruction immediate du portefeuille. */
+  local droppedRailSearch = this._reloadDroppedRailSearch ? 1 : 0;
+  if (this._reloadDroppedRailSearch) {
+    this._railSearch = null;
+
+    this._projects = null;
+    this._ranked = null;
+    this._portfolioInvalidated = true;
+    if (this._taskQueue != null) {
+      foreach (task in this._taskQueue) {
+        if (task.name == "catalog") {
+          task.enabled = true;
+          task.dueCycle = this._taskCycle;
+          break;
+        }
+      }
+    }
+  }
+  this._reloadDroppedRailSearch = false;
+  this._v184InitRailSlots();
+
+  /* C80 : au rechargement, un travailleur "rail_search" ou "rail_stock" restaure sans
+   * _railSearch (qui n'est pas sauvegarde) doit etre abandonne proprement. */
+  if (this._activeWorker != null && (this._activeWorker.kind == "rail_search" || this._activeWorker.kind == "rail_stock") && this._railSearch == null) {
+    OpexWorkerCancel(this._activeWorker);
+    this._activeWorker = null;
+  }
+
+  /* C80 etape 1 : le stock de traces rail est reconstructible / transitoire (non persiste). */
+  this._railReadyStock = {};
+  /* C80 etape 2 : la table de retrait temporaire des paires est reconstructible. */
+  this._railStockCooldown = {};
+  /* C121 : la liste de preparation et l'A* en cours ne sont pas sauves. On recalcule. */
+  this._c121RailPrepCandidates = null;
+  this._c121RailPrepMonth = -1;
+  this._c121RailPrepHold = false;
+  this._c121RailPrepYieldLogged = false;
+  this._c121RailPrepMinAirCap = -1;
+
+  /* C77 : le travailleur regen_candidates retrouve son instance (non sauvegardee). */
+  if (this._activeWorker != null && this._activeWorker.kind == "regen_candidates") {
+    this._activeWorker.ai <- this;
+  }
+
+  this._c41RailSignalLines = this._filterPersistedRailRepairQueue(this._c41RailSignalLines);
+  this._c41RailJunctionLines = this._filterPersistedRailRepairQueue(this._c41RailJunctionLines);
+  this._rearmPersistedRailRepairTasks();
+
+  this._purgeUnprofitableStreaks();
+  if (this._vehiclesToRetire != null) {
+    local staleRetireTickets = [];
+    foreach (vehicle, ignored in this._vehiclesToRetire) {
+      if (!AIVehicle.IsValidVehicle(vehicle)) staleRetireTickets.append(vehicle);
+    }
+    foreach (vehicle in staleRetireTickets) {
+      if (vehicle in this._vehiclesToRetire) delete this._vehiclesToRetire[vehicle];
+    }
+  }
+  {
+    this._c76ForceReloadRegen = true;
+  }
+  if (FAIR_PLAY_COURTESY && _budgetSignIds != null) {
+    OpexClearBudgetSigns(_budgetSignIds);
+  }
+  /* Sans sonde : cette unique preuve doit toujours accompagner un rechargement, jamais une partie neuve. */
+  OpexDecide("LOAD_RECONCILE", "saved=" + saved + " kept=" + kept + " dropped=" + dropped
+             + " vehicles_purged=" + purgedVehicles
+             + " rail_expansion_restored=" + railExpansion.restored
+             + " rail_expansion_completed=" + railExpansion.completed
+             + " rail_expansion_dropped=" + railExpansion.dropped
+             + " rail_expansion_promoted=" + railExpansion.promoted
+             + " rail_expansion_pending_recovered=" + railExpansion.pending_recovered
+             + " rail_expansion_ambiguous_aborted=" + railExpansion.ambiguous_aborted
+             + " rail_search_dropped=" + droppedRailSearch
+             + " rail_signal_queue=" + this._c41RailSignalLines.len()
+             + " rail_junction_queue=" + this._c41RailJunctionLines.len());
+}

@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 jrdoublet
+/* Module AIR extrait de builder_air.nut (R11) : flottes et ajout d'avions. */
+/* Ajoute un seul avion a une liaison deja mesuree. Le clonage partage les ordres et ne refait ni
+ * recherche de sites ni construction d'infrastructure : c'est le chemin marginal au meilleur
+ * profit/opcode. Toute decision de l'appeler reste dans main.nut, apres une annee de donnees. */
+/* V252 Mode 1 : determine le meilleur modele d'avion actuellement constructible
+ * pour une ligne donnee selon le critere causal du catalogue AIR (C68 / OpexAirEconomics).
+ * Retourne l'EngineID retenu, ou null si choix indisponible ou impossible. */
+function OpexAirBestEngineForLine(line, catalog)
+{
+  if (catalog == null || !("airPlaneChoicesByAirport" in catalog) || catalog.airPlaneChoicesByAirport == null) {
+    return null;
+  }
+  if (line == null || !("stationA" in line) || !("stationB" in line)) return null;
+  if (!AIAirport.IsAirportTile(line.stationA) || !AIAirport.IsAirportTile(line.stationB)) return null;
+
+  local typeA = AIAirport.GetAirportType(line.stationA);
+  local typeB = AIAirport.GetAirportType(line.stationB);
+  if (!AIAirport.IsValidAirportType(typeA) || !AIAirport.IsValidAirportType(typeB)) return null;
+
+  local isSmall = (typeA == AIAirport.AT_SMALL || typeA == AIAirport.AT_COMMUTER ||
+                   typeB == AIAirport.AT_SMALL || typeB == AIAirport.AT_COMMUTER);
+  local airportType = isSmall ? ((typeA == AIAirport.AT_SMALL || typeA == AIAirport.AT_COMMUTER) ? typeA : typeB) : typeA;
+
+  if (!(airportType in catalog.airPlaneChoicesByAirport)) return null;
+  local choices = catalog.airPlaneChoicesByAirport[airportType];
+  if (choices == null || choices.len() == 0) return null;
+
+  local distance = ("distance" in line && line.distance > 0) ? line.distance : 0;
+  if (distance <= 0) {
+    distance = AIMap.DistanceManhattan(line.stationA, line.stationB);
+  }
+  local cargo = ("cargo" in line) ? line.cargo : catalog.paxCargo;
+  /* Demande inconnue : pas de choix, le renfort clone comme avant. */
+  local monthlyPax = ("airMonthlyPax" in line && line.airMonthlyPax > 0)
+      ? line.airMonthlyPax
+      : (("monthlyPax" in line && line.monthlyPax > 0) ? line.monthlyPax : 0);
+  if (monthlyPax <= 0) return null;
+
+  local airportTile = ("originA" in line) && AIAirport.IsAirportTile(line.originA)
+      ? line.originA : line.stationA;
+  local hangar = AIAirport.GetHangarOfAirport(airportTile);
+  local hasHangar = AIMap.IsValidTile(hangar) && AIAirport.IsHangarTile(hangar);
+
+  local bestPlaneId = -1;
+  local bestEconomics = null;
+  /* OpexAirEconomics lit price et maintenance sans condition : aeroports deja payes. */
+  local airportObj = { type = airportType, price = 0, maintenance = 0 };
+
+  foreach (plane in choices) {
+    if (!AIEngine.IsValidEngine(plane.id) || !AIEngine.IsBuildable(plane.id)) continue;
+    if (!OpexAirPlaneInRange(plane, distance)) continue;
+    if (!OpexAirAirportAcceptsPlane(typeA, plane.planeType) || !OpexAirAirportAcceptsPlane(typeB, plane.planeType)) continue;
+    if (!AIEngine.CanRefitCargo(plane.id, cargo)) continue;
+    if (hasHangar && AIVehicle.GetBuildWithRefitCapacity(hangar, plane.id, cargo) <= 0) continue;
+
+    local economics = OpexAirEconomics(catalog, airportObj, plane, distance, monthlyPax, false, 0, 0, 0, 1);
+    if (economics == null) continue;
+
+    if (bestEconomics == null || economics.profitAnnual > bestEconomics.profitAnnual ||
+        (economics.profitAnnual == bestEconomics.profitAnnual && economics.roi > bestEconomics.roi)) {
+      bestEconomics = economics;
+      bestPlaneId = plane.id;
+    }
+  }
+
+  if (bestPlaneId < 0) return null;
+  return bestPlaneId;
+}
+
+/* P3 n'intercepte pas la voie V252 quand un renfort sert aussi de migration
+ * vers un nouveau moteur ; ne recalculer le choix qu'en cas de veto potentiel. */
+function OpexP3HasEngineUpgrade(line, catalog)
+{
+  if (line == null || !("vehicles" in line) || line.vehicles == null) return false;
+  local template = null;
+  foreach (v in line.vehicles) {
+    if (AIVehicle.IsValidVehicle(v) && AIVehicle.GetVehicleType(v) == AIVehicle.VT_AIR) {
+      template = v;
+      break;
+    }
+  }
+  if (template == null) return false;
+  local candidate = OpexAirBestEngineForLine(line, catalog);
+  return candidate != null && candidate != AIVehicle.GetEngineType(template)
+      && AIEngine.IsBuildable(candidate);
+}
+
+function OpexAirAddPlane(line, catalog = null, lines = null, forcedEngine = null)
+{
+  local result = { added = 0, reason = "" };
+  if (!("vehicles" in line) || line.vehicles.len() == 0) {
+    result.reason = "NOVEH"; return result;
+  }
+  local airportTile = ("originA" in line) && AIAirport.IsAirportTile(line.originA)
+      ? line.originA
+      : (AIAirport.IsAirportTile(line.stationA) ? line.stationA : null);
+  if (airportTile == null) {
+    result.reason = "NOAIR"; return result;
+  }
+  local hangar = AIAirport.GetHangarOfAirport(airportTile);
+  if (!AIMap.IsValidTile(hangar) || !AIAirport.IsHangarTile(hangar)) {
+    result.reason = "HANG"; return result;
+  }
+  local template = null;
+  foreach (v in line.vehicles) {
+    if (AIVehicle.IsValidVehicle(v) && AIVehicle.GetVehicleType(v) == AIVehicle.VT_AIR) {
+      template = v; break;
+    }
+  }
+  if (template == null) { result.reason = "NOLIVE"; return result; }
+  local oldEngine = AIVehicle.GetEngineType(template);
+  local targetEngine = oldEngine;
+  /* The marginal model prices a SAME-engine acquisition. Never mix a
+   * V252 suggested replacement into a verified V161 marginal purchase. */
+  if (forcedEngine != null && (forcedEngine != oldEngine
+      || !AIEngine.IsValidEngine(forcedEngine) || !AIEngine.IsBuildable(forcedEngine))) {
+    result.reason = "MARGINAL_ENGINE_STALE"; return result;
+  }
+
+  if (catalog != null && forcedEngine == null) {
+    local candidate = OpexAirBestEngineForLine(line, catalog);
+    if (candidate != null && candidate != oldEngine && AIEngine.IsBuildable(candidate)) {
+      targetEngine = candidate;
+    }
+  }
+
+  local price = AIEngine.GetPrice(targetEngine);
+  if (price <= 0) { result.reason = "PRICE"; return result; }
+  local need = price + 1000;
+  if ((ESTIM_UNIFIE & 2) != 0)
+    need = OpexEstimFinanceCapital("fleet", price, 0);
+  local money = AICompany.GetBankBalance(AICompany.COMPANY_SELF);
+  if (money < need) {
+    if (money < need) {
+      result.reason = "CASH"; return result;
+    }
+  }
+
+  /* AIVehicle.IsValidVehicle attend un VehicleID entier, jamais null. */
+  local extra = -1;
+  if (targetEngine == oldEngine) {
+    extra = AIVehicle.CloneVehicle(hangar, template, true);
+    if (extra == null || !AIVehicle.IsValidVehicle(extra)) {
+      local engine = AIVehicle.GetEngineType(template);
+      local cargo = ("cargo" in line) ? line.cargo : 0;
+      extra = AIVehicle.BuildVehicleWithRefit(hangar, engine, cargo);
+      if (extra != null && AIVehicle.IsValidVehicle(extra)) {
+        if (!AIOrder.ShareOrders(extra, template)) {
+          if (AIVehicle.IsStoppedInDepot(extra)) AIVehicle.SellVehicle(extra);
+          result.reason = "ORDER"; return result;
+        }
+      }
+    }
+  } else {
+    local cargo = ("cargo" in line) ? line.cargo : 0;
+    extra = AIVehicle.BuildVehicleWithRefit(hangar, targetEngine, cargo);
+    if (extra != null && AIVehicle.IsValidVehicle(extra)) {
+      if (!AIOrder.ShareOrders(extra, template) && !AIOrder.CopyOrders(extra, template)) {
+        if (AIVehicle.IsStoppedInDepot(extra)) AIVehicle.SellVehicle(extra);
+        /* L'avion a ete revendu : repli sur le clonage de l'ancien modele. */
+        extra = -1;
+      }
+    }
+    if (extra == null || !AIVehicle.IsValidVehicle(extra)) {
+      targetEngine = oldEngine;
+      price = AIEngine.GetPrice(oldEngine);
+      extra = AIVehicle.CloneVehicle(hangar, template, true);
+    }
+  }
+
+  if (extra == null || !AIVehicle.IsValidVehicle(extra)) {
+    result.reason = "CLONE|" + AIError.GetLastError();
+    return result;
+  }
+  if (!AIVehicle.StartStopVehicle(extra)) {
+    if (AIVehicle.IsStoppedInDepot(extra)) AIVehicle.SellVehicle(extra);
+    result.reason = "START"; return result;
+  }
+  line.vehicles.append(extra);
+  if (targetEngine != oldEngine) {
+    line.refleetEngine = targetEngine;
+    if (DECISION_LOG) OpexDecide("V252_ENGINE", "action=reinforce line=" + (("lineId" in line) ? line.lineId : -1)
+                 + " old_engine=" + oldEngine + " new_engine=" + targetEngine + " price=" + price
+                 + " reason=reinforce");
+  }
+  result.added = 1;
+  result.reason = "OK";
+  return result;
+}
+
+/* Reconstitue un avion perdu sans dependre d'un appareil encore vivant. Le moteur
+ * est memorise dans la ligne a sa construction; les deux aeroports sont des
+ * destinations durables, donc les ordres peuvent etre recrees sans clonage. */
+function OpexAirRefleetCrashedPlane(line, catalog = null)
+{
+  local result = { added = 0, reason = "" };
+  if (!(("refleetEngine" in line) && line.refleetEngine >= 0)) {
+    result.reason = "NOENGINE"; return result;
+  }
+  if (!AIAirport.IsAirportTile(line.stationA) || !AIAirport.IsAirportTile(line.stationB)) {
+    result.reason = "NOAIRPORT"; return result;
+  }
+  local hangar = AIAirport.GetHangarOfAirport(line.stationA);
+  if (!AIMap.IsValidTile(hangar) || !AIAirport.IsHangarTile(hangar)) {
+    result.reason = "HANGAR"; return result;
+  }
+
+  local oldEngine = line.refleetEngine;
+  local targetEngine = oldEngine;
+  if (catalog != null) {
+    local candidate = OpexAirBestEngineForLine(line, catalog);
+    if (candidate != null && candidate != oldEngine && AIEngine.IsBuildable(candidate)) {
+      targetEngine = candidate;
+    }
+  }
+
+  if (AIVehicle.GetBuildWithRefitCapacity(hangar, targetEngine, line.cargo) <= 0) {
+    if (targetEngine != oldEngine && AIVehicle.GetBuildWithRefitCapacity(hangar, oldEngine, line.cargo) > 0) {
+      targetEngine = oldEngine;
+    } else {
+      result.reason = "REFIT"; return result;
+    }
+  }
+  local price = AIEngine.GetPrice(targetEngine);
+  if (price <= 0 || AICompany.GetBankBalance(AICompany.COMPANY_SELF) < price) {
+    result.reason = "CASH"; return result;
+  }
+  local plane = AIVehicle.BuildVehicleWithRefit(hangar, targetEngine, line.cargo);
+  if (!AIVehicle.IsValidVehicle(plane)) {
+    if (targetEngine != oldEngine) {
+      targetEngine = oldEngine;
+      price = AIEngine.GetPrice(oldEngine);
+      plane = AIVehicle.BuildVehicleWithRefit(hangar, oldEngine, line.cargo);
+    }
+  }
+  if (!AIVehicle.IsValidVehicle(plane)) { result.reason = "BUILD"; return result; }
+  local flagsA = AIOrder.OF_NONE;
+  local flagsB = AIOrder.OF_NONE;
+  if (!AIOrder.AppendOrder(plane, line.stationA, flagsA) ||
+      !AIOrder.AppendOrder(plane, line.stationB, flagsB) || AIOrder.GetOrderCount(plane) != 2) {
+    AIVehicle.SellVehicle(plane); result.reason = "ORDER"; return result;
+  }
+  if (!AIVehicle.StartStopVehicle(plane)) {
+    if (AIVehicle.IsStoppedInDepot(plane)) AIVehicle.SellVehicle(plane);
+    result.reason = "START"; return result;
+  }
+  if (!("vehicles" in line)) line.vehicles <- [];
+  else if (line.vehicles == null) line.vehicles = [];
+  line.vehicles.append(plane);
+  if ("vehicle" in line) line.vehicle = plane;
+  else line.vehicle <- plane;
+  if (targetEngine != oldEngine) {
+    line.refleetEngine = targetEngine;
+    if (DECISION_LOG) OpexDecide("V252_ENGINE", "action=crash line=" + (("lineId" in line) ? line.lineId : -1)
+                 + " old_engine=" + oldEngine + " new_engine=" + targetEngine + " price=" + price
+                 + " reason=crash_refleet");
+  }
+  result.added = 1; result.reason = "OK";
+  return result;
+}
+
+/* V161 : valeur NETTE du prochain avion, en GBP/an, pour UN achat.
+ * C121 chiffre la cannibalisation du reseau pour un palier n -> n+1 exact.
+ * Une marge observee sur un palier precedent n'est pas celle du prochain.
+ * Sur une ligne isolee, le modele physique permet une nouvelle comparaison.
+ * Sur un hub sans estimation C121 actuelle, refuser : le modele simplifie
+ * ne connait pas le manque a gagner des autres lignes de ce hub. */
+function OpexV161NextMarginal(line, catalog, have, neighbours)
+{
+  if (line == null || catalog == null || have <= 0 || !("vehicles" in line)
+      || line.vehicles == null || !("cargo" in line)) return null;
+  local template = null;
+  foreach (v in line.vehicles) {
+    if (AIVehicle.IsValidVehicle(v) && AIVehicle.GetVehicleType(v) == AIVehicle.VT_AIR) {
+      template = v; break;
+    }
+  }
+  if (template == null) return null;
+  local engineId = AIVehicle.GetEngineType(template);
+  /* Changement V252 de moteur : le modele de n appareils identiques ne
+   * chiffre pas le melange d'avions; cette transaction exige un autre devis. */
+  /* Under this isolated ESTIM experiment, a profitable same-engine
+   * marginal growth can be priced without the unrelated V252 upgrade veto.
+   * Outside ESTIM the historical veto remains exactly as before. */
+  if ((ESTIM_UNIFIE & 1) == 0) {
+    local upgrade = OpexAirBestEngineForLine(line, catalog);
+    if (upgrade != null && upgrade != engineId) return null;
+  }
+  if (!AIEngine.IsValidEngine(engineId) || !AIEngine.IsBuildable(engineId)) return null;
+  local price = AIEngine.GetPrice(engineId);
+  if (price <= 0) return null;
+  /* Une observation du dernier renfort deficitaire constitue un veto. */
+  if (("c121MarginalSamples" in line) && line.c121MarginalSamples > 0
+      && ("c121LastMarginalProfit" in line) && line.c121LastMarginalProfit <= 0)
+    return null;
+
+  if (("c121MarginalBaseVehicles" in line) && line.c121MarginalBaseVehicles == have
+      && ("c121MarginalSamples" in line) && line.c121MarginalSamples == 0
+      && ("c121MarginalProfit" in line) && ("c121MarginalRevenue" in line)
+      && ("c121MarginalRunning" in line) && ("c121MarginalAmort" in line)) {
+    local dR = line.c121MarginalRevenue;
+    local dE = line.c121MarginalRunning;
+    local dA = line.c121MarginalAmort;
+    if ((ESTIM_UNIFIE & 4) != 0 && ("estimMarginalBaseVehicles" in line)
+        && line.estimMarginalBaseVehicles == have
+        && ("estimMarginalRawRevenue" in line)
+        && ("estimMarginalRunning" in line) && ("estimMarginalAmort" in line)) {
+      dR = (line.estimMarginalRawRevenue.tofloat() * ESTIM_K_R.air).tointeger();
+      dE = line.estimMarginalRunning;
+      dA = line.estimMarginalAmort;
+    }
+    /* Save/Load arrondit les floats top-level separement : reconstruire le
+     * profit depuis les trois composantes sauvegardees reste exact pour le
+     * classement, meme si l'ancien champ c121MarginalProfit differait d'1 GBP. */
+    local dP = dR - dE - dA;
+    if (dP <= 0 || dR <= 0 || dE < 0 || dA < 0) return null;
+    return { revenue = dR, running = dE, amort = dA, profit = dP,
+             price = price, engine = engineId, baseVehicles = have, source = "c121" };
+  }
+  if (neighbours > 0) return null;
+  local monthlyPax = ("airMonthlyPax" in line && line.airMonthlyPax > 0)
+      ? line.airMonthlyPax : (("monthlyPax" in line && line.monthlyPax > 0) ? line.monthlyPax : 0);
+  if (monthlyPax <= 0 || !("stationA" in line) || !("stationB" in line)
+      || !AIAirport.IsAirportTile(line.stationA) || !AIAirport.IsAirportTile(line.stationB)) return null;
+  local typeA = AIAirport.GetAirportType(line.stationA);
+  local typeB = AIAirport.GetAirportType(line.stationB);
+  if (!AIAirport.IsValidAirportType(typeA) || !AIAirport.IsValidAirportType(typeB)) return null;
+  local airportType = (typeA == AIAirport.AT_SMALL || typeA == AIAirport.AT_COMMUTER)
+      ? typeA : ((typeB == AIAirport.AT_SMALL || typeB == AIAirport.AT_COMMUTER)
+          ? typeB : typeA);
+  if (!("airPlaneChoicesByAirport" in catalog) || catalog.airPlaneChoicesByAirport == null
+      || !(airportType in catalog.airPlaneChoicesByAirport)) return null;
+  local plane = null;
+  foreach (choice in catalog.airPlaneChoicesByAirport[airportType]) {
+    if (choice.id == engineId) { plane = choice; break; }
+  }
+  if (plane == null) return null;
+  local distance = ("distance" in line && line.distance > 0) ? line.distance
+      : AIMap.DistanceManhattan(line.stationA, line.stationB);
+  if (distance <= 0 || !OpexAirPlaneInRange(plane, distance)) return null;
+  local airport = { type = airportType, price = 0, maintenance = 0 };
+  local before = OpexAirEconomics(catalog, airport, plane, distance,
+      monthlyPax, false, 0, 0, 0, have);
+  local after = OpexAirEconomics(catalog, airport, plane, distance,
+      monthlyPax, false, 0, 0, 0, have + 1);
+  if (before == null || after == null) return null;
+  local dR = after.revenueAnnual - before.revenueAnnual;
+  local dE = after.runningAnnual - before.runningAnnual;
+  local dA = after.amortAnnual - before.amortAnnual;
+  if ((ESTIM_UNIFIE & 1) != 0) dR = (dR.tofloat() * ESTIM_K_R.air).tointeger();
+  local dP = dR - dE - dA;
+  if (dR <= 0 || dP <= 0 || dE < 0 || dA < 0) return null;
+  return { revenue = dR, running = dE, amort = dA, profit = dP,
+           price = price, engine = engineId, baseVehicles = have, source = "physical" };
+}
+
+function OpexV161NeighbourCount(line, routesIndex)
+{
+  if (line == null || routesIndex == null) return 0;
+  local a = OpexAirLineStationId(line, 0);
+  local b = OpexAirLineStationId(line, 1);
+  local count = 0;
+  if (a in routesIndex) count += routesIndex[a] - 1;
+  if (b != a && (b in routesIndex)) count += routesIndex[b] - 1;
+  return count > 0 ? count : 0;
+}

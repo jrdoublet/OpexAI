@@ -1,0 +1,1077 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 jrdoublet
+/* C65 passe 3 : un dispatch par tache de file, corps deplace depuis
+ * _runNextTask. */
+/* R4 : seuil d'admission, pas estimation du cout total d'une paire AIR.
+ * Garder 2000 opcodes de marge de dispatch plutot qu'exiger plus qu'un tick
+ * complet (10000). Une tranche peut suspendre la VM : ne pas enchainer alors
+ * sur le budget neuf, rendre la main a la boucle d'evenements. */
+function OpexC121CatalogCanContinue(owner, continuationTick)
+{
+  return  owner._activeWorker == null
+      && owner._railSearch == null && owner._railExpansion == null
+      && AIController.GetTick() == continuationTick
+      && AIController.GetOpsTillSuspend() > 2000;
+}
+
+function OpexC78StartCatalogAirRebuild(owner, task, ym, fleetPlan, refreshReason,
+                                       c76Full = false, c76Quarter = 0, c76Reason = null)
+{
+  if (MODE_AIR && owner._generationStageMonth < 0)
+    owner._generationStageMonth = ym;
+  local stage = OPEX_STAGE_COMPLETE;
+  if (STAGED_BOOTSTRAP && owner._generationStage < OPEX_STAGE_COMPLETE) {
+    stage = owner._generationStage;
+  }
+  local doAir = stage == OPEX_STAGE_AIR_ONLY || stage == OPEX_STAGE_AIR_RAIL
+      || stage == OPEX_STAGE_COMPLETE;
+  if (MODE_AIR) {
+    /* Estampille annee * 12 + mois (1..12) : decembre reste dans son annee. */
+    local firstYear = owner._generationStageMonth >= 0
+        ? (owner._generationStageMonth - 1) / 12 : AIDate.GetYear(AIDate.GetCurrentDate());
+    if (AIDate.GetYear(AIDate.GetCurrentDate()) == firstYear) doAir = true;
+  }
+  local hasAir = owner._catalog != null
+      && ((("airCombos" in owner._catalog) && owner._catalog.airCombos != null
+           && owner._catalog.airCombos.len() > 0)
+          || owner._catalog.airport != null);
+  if (!doAir || !hasAir) return false;
+  /* Le catalogue C121 est decoupe quelle que soit la taille du vivier. */
+  if (!("towns" in owner._catalog) || owner._catalog.towns == null) return false;
+
+  local band = stage == OPEX_STAGE_AIR_ONLY ? PAX_BAND_AIR_ONLY
+      : (stage == OPEX_STAGE_AIR_RAIL ? PAX_BAND_AIR_RAIL : PAX_BAND_ALL);
+  task.c78AirRebuild <- {
+    ym = ym,
+    stage = stage,
+    phase = "primary",
+    band = band,
+    fleetPlan = fleetPlan,
+    plans = [],
+    cursor = {},
+    bestPlan = null,
+    published = false,
+    partialPending = false,
+    partialBestPlan = null,
+    lastPublishedCount = 0,
+    tickSlices = 0,
+    lastSliceTick = -1,
+    airOps = 0,
+    regenOps = 0,
+    refreshReason = refreshReason,
+    c76Full = c76Full,
+    c76Quarter = c76Quarter,
+    c76Reason = c76Reason,
+    /* AC06 v2 : snapshot apres refresh initial, avant les evenements tardifs. */
+    c76StartRevisions = c76Full
+        ? OpexAC06CaptureRevisionNumbers(owner) : null,
+  };
+  OpexV147ArmPhases(owner);
+  return true;
+}
+
+function OpexC78RequeueInitialCatalogSlice(owner, task)
+{
+  /* Les phases AIR ont leurs propres entrees de file. */
+}
+
+/* V147 (CD07/B) : entrees de file des phases du rebuild AIR. L'etat reste porte par
+ * l'entree catalog (index 0) ; seule l'entree de la phase courante est activee. */
+function OpexV147ExtendQueue(owner)
+{
+  if (owner._taskQueue == null || V147_TASK_BASE >= 0) return;
+  V147_TASK_BASE = owner._taskQueue.len();
+  owner._taskQueue.append({ name = "air_cat_scan", dueCycle = 2147483647, enabled = false });
+  owner._taskQueue.append({ name = "air_cat_publish", dueCycle = 2147483647, enabled = false });
+  owner._taskQueue.append({ name = "air_cat_apply", dueCycle = 2147483647, enabled = false });
+}
+
+function OpexV147CurrentPhase(s)
+{
+  if (s == null || typeof s != "table") return null;
+  if (("partialPending" in s) && s.partialPending) return "air_cat_publish";
+  if (s.phase == "apply") return "air_cat_apply";
+  return "air_cat_scan";
+}
+
+/* Active la seule phase due. Bootstrap (aucun portefeuille) : due au cycle courant avec le
+ * curseur sur elle, comme le requeue historique de l'index 0 ; sinon un pas par tour. */
+function OpexV147ArmPhases(owner)
+{
+  if (V147_TASK_BASE < 0) return;
+  local catalogTask = owner._taskQueue[0];
+  local s = (("c78AirRebuild" in catalogTask) && catalogTask.c78AirRebuild != null)
+      ? catalogTask.c78AirRebuild : null;
+  local current = OpexV147CurrentPhase(s);
+  for (local i = V147_TASK_BASE; i < V147_TASK_BASE + 3; i++) {
+    local t = owner._taskQueue[i];
+    if (current != null && t.name == current) {
+      t.enabled = true;
+      if (owner._projects == null) {
+        t.dueCycle = owner._taskCycle;
+        owner._taskCursor = i;
+      } else if (t.dueCycle > owner._taskCycle + 1) {
+        t.dueCycle = owner._taskCycle + 1;
+      }
+    } else {
+      t.enabled = false;
+      t.dueCycle = 2147483647;
+    }
+  }
+}
+
+function OpexV147PhaseTask(owner)
+{
+  if (V147_TASK_BASE < 0) return null;
+  local catalogTask = owner._taskQueue[0];
+  if (!("c78AirRebuild" in catalogTask) || catalogTask.c78AirRebuild == null) return null;
+  local current = OpexV147CurrentPhase(catalogTask.c78AirRebuild);
+  for (local i = V147_TASK_BASE; i < V147_TASK_BASE + 3; i++) {
+    if (owner._taskQueue[i].name == current) return owner._taskQueue[i];
+  }
+  return null;
+}
+
+function OpexAI::_dispatchAirCatalogPhase(task, year)
+{
+  local catalogTask = this._taskQueue[0];
+  local s = (("c78AirRebuild" in catalogTask) && catalogTask.c78AirRebuild != null)
+      ? catalogTask.c78AirRebuild : null;
+  if (s == null || OpexV147CurrentPhase(s) != task.name) {
+    OpexV147ArmPhases(this);
+    if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return false;
+  }
+  V147_IN_PHASE = true;
+  local ran = this._dispatchCatalog(catalogTask, year);
+  V147_IN_PHASE = false;
+  OpexV147ArmPhases(this);
+  return ran;
+}
+
+/* CD06: publication au passage suivant et apply final restent des transactions
+ * distinctes, sans changer le budget ou le curseur de C78. */
+function OpexC78PublishPartialAir(owner, s)
+{
+    local partialAir = {
+      complete = true,
+      airPlan = ("partialBestPlan" in s) ? s.partialBestPlan : null,
+      airPlans = s.plans,
+      airOps = s.airOps,
+    };
+    local spPartial = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.rebuild") : null;
+    /* AIR 03/10 1 : seulement le lot partiel. La phase apply plus bas garde
+     * le rebuild complet. Premiere publication (aucun projet de ce scan) :
+     * rebuild, il n'y a pas encore de groupes a completer. */
+    local publishCounts = null;
+    if (owner._projects != null && ("lastPublishedCount" in s) && s.lastPublishedCount > 0) {
+      publishCounts = OpexAir0310PublishIncremental(owner, s.plans, s.lastPublishedCount,
+          s.airOps, partialAir.airPlan);
+    } else if (EB14_PROGRESSIVE && owner._projects != null && ("lastPublishedCount" in s)) {
+      publishCounts = OpexAir0310PublishIncremental(owner, s.plans, s.lastPublishedCount,
+          s.airOps, partialAir.airPlan);
+    }
+    if (publishCounts == null) {
+      owner._rebuildProjects(s.fleetPlan, partialAir, false);
+    }
+    if (spPartial != null) OpexSpanEnd(spPartial);
+    if (PROBE_SPAN_TRACE) {
+      local publishMode = "full";
+      local publishAdded = 0;
+      local publishReconverted = 0;
+      local publishRefreshed = 0;
+      local publishInvalidated = 0;
+      if (publishCounts != null) {
+        publishMode = "incr";
+        publishAdded = publishCounts.added;
+        publishReconverted = publishCounts.reconverted;
+        publishInvalidated = publishCounts.invalidated;
+        if ("refreshed" in publishCounts) publishRefreshed = publishCounts.refreshed;
+      } else {
+        /* Plans soumis au rebuild, pas les projets gardes : FromAir peut
+         * encore en refuser, et ce chemin ne les compte pas. */
+        publishAdded = s.plans.len() - s.lastPublishedCount;
+        if (publishAdded < 0) publishAdded = 0;
+        publishReconverted = s.lastPublishedCount;
+        if (publishReconverted < 0) publishReconverted = 0;
+      }
+      OpexDecide("AIR0310_PUBLISH", "mode=" + publishMode
+          + " added=" + publishAdded
+          + " reconverted=" + publishReconverted
+          + " refreshed=" + publishRefreshed
+          + " invalidated=" + publishInvalidated
+          + " total_plans=" + s.plans.len());
+    }
+    owner._ranked = owner._projects != null ? owner._projects.rail : null;
+    owner._portfolioInvalidated = false;
+    s.published = true;
+    s.lastPublishedCount = s.plans.len();
+    s.partialPending = false;
+    s.partialBestPlan = null;
+    return false;
+}
+
+/* EB-14 only: finish an AIR scan without rebuilding unrelated RAIL/ROAD.
+ * Kept outside ApplyAir so the frozen OFF branch remains visibly unchanged. */
+function OpexEB14ApplyAir(owner, s)
+{
+  if (!EB14_PROGRESSIVE || owner._projects == null) return false;
+  return OpexAir0310PublishIncremental(owner, s.plans,
+      s.lastPublishedCount, s.airOps, s.bestPlan) != null;
+}
+
+/* EB-14 : la fin d'un scan AIR ne peut acquitter ni les couches RAIL ni
+ * les autres modes qui n'ont PAS ete regeneres. PO01C consommera leurs
+ * revisions independamment et progressivement. */
+function OpexEB14AcknowledgeAirOnly(owner, snapshot)
+{
+  if (snapshot != null) {
+    if (!("air" in owner._c76ModeConsumed))
+      owner._c76ModeConsumed.rawset("air", {});
+    local consumed = owner._c76ModeConsumed["air"];
+    local sumRev = 0;
+    foreach (layer in owner._c76GetModeDeps("air")) {
+      local rev = OpexAC06SnapshotLayer(snapshot, layer);
+      local old = layer in consumed ? consumed[layer] : 0;
+      consumed.rawset(layer, rev > old ? rev : old);
+      sumRev += consumed[layer];
+    }
+    owner._c76ModeConsumedRevision.rawset("air", sumRev);
+  }
+  if (PO02_INDEPENDENT_EXPIRY && snapshot != null) {
+    PO02_LAST_PUBLISH_DATE["air"] = AIDate.GetCurrentDate();
+  }
+  owner._po01cPending = true;
+  if (DECISION_LOG) OpexDecide("EB14_C76", "ack=air_only land=pending");
+}
+
+function OpexC78ApplyAir(owner, task, year, s)
+{
+    local airOverride = {
+      complete = true,
+      airPlan = ("bestPlan" in s) ? s.bestPlan : null,
+      airPlans = s.plans,
+      airOps = s.airOps,
+    };
+    local rebuildMark = OpexOpsMeasureBegin();
+    local spApply = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.rebuild") : null;
+    /* EB-14 : la tranche AIR a deja ete publiee dans le portefeuille
+     * courant. Revaluer seulement les plans neufs et les candidats vivants,
+     * sans reconstruire les autres modes a chaque fermeture de curseur. */
+    if (!OpexEB14ApplyAir(owner, s))
+      owner._rebuildProjects(s.fleetPlan, airOverride);
+    if (spApply != null) OpexSpanEnd(spApply);
+    s.regenOps += OpexOpsMeasureEnd(rebuildMark);
+    if (C39_INVALIDATION_PROBE) {
+      local reason = s.c76Full && s.c76Reason != null ? s.c76Reason : s.refreshReason;
+      local regenDays = (s.regenOps + 93000) / 186000;
+      owner._c76RecordRegen("full", s.regenOps, regenDays, year, reason);
+    }
+    if (s.c76Full) {
+      if (EB14_PROGRESSIVE && PO01C_REGEN_SPLIT) {
+        OpexEB14AcknowledgeAirOnly(owner,
+            ("c76StartRevisions" in s) ? s.c76StartRevisions : null);
+      } else if (("c76StartRevisions" in s)
+          && s.c76StartRevisions != null) {
+        OpexAC06AcknowledgeSnapshot(owner, s.c76StartRevisions);
+      } else {
+        owner._c76AcknowledgeAllLayers();
+      }
+      owner._c76LastRegenQuarter = s.c76Quarter;
+      owner._c76ForceReloadRegen = false;
+    }
+    owner._lastCatalogMonth = s.ym;
+    delete task.c78AirRebuild;
+    return true;
+}
+
+function OpexC78ContinueCatalogAirRebuild(owner, task, year)
+{
+  if (!("c78AirRebuild" in task) || task.c78AirRebuild == null
+      || typeof task.c78AirRebuild != "table") return true;
+  local s = task.c78AirRebuild;
+
+  /* Publication progressive par tranche productive au passage SUIVANT :
+   * depuis le commit 38a4ff3, la garde historique !s.published (qui limitait
+   * la publication a une seule fois par scan) a ete remplacee par la garde
+   * s.plans.len() > s.lastPublishedCount. Chaque tranche qui decouvre de nouveaux
+   * plans arme ainsi s.partialPending = true pour republier au tour suivant.
+   * Le scan ayant deja rendu la main sur son budget d'opcodes, la publication
+   * ne transforme pas une tranche bornee en passe monolithique.
+   * Mode de publication : le premier lot (lastPublishedCount == 0 ou _projects null)
+   * passe par un _rebuildProjects complet ; les republications suivantes passent par
+   * OpexAir0310PublishIncremental si AIR0310_INCREMENTAL_PUBLISH est actif (defaut),
+   * ou se replient sur un _rebuildProjects complet sinon. advanceStage=false garde
+   * le bootstrap sur sa meme etape jusqu'au lot exact en phase apply. */
+  if (("partialPending" in s) && s.partialPending)
+    return OpexC78PublishPartialAir(owner, s);
+
+  /* La tranche AIR est un calcul prive jusqu'a sa completion. L'appliquer dans
+   * le meme passage qui vient d'epuiser son budget annulerait le bornage. */
+  if (s.phase == "apply") return OpexC78ApplyAir(owner, task, year, s);
+
+  local liveOps = AIController.GetOpsTillSuspend();
+  local sliceBudget = liveOps;
+  if (sliceBudget <= 0) sliceBudget = 1;
+  if (sliceBudget > AIR_PLAN_SLICE_OPS) sliceBudget = AIR_PLAN_SLICE_OPS;
+  if (sliceBudget > 150000) sliceBudget = 150000;
+  local mark = OpexOpsMeasureBegin();
+
+
+  local best = OpexAirPlans(owner._catalog, owner._lines, 0, s.plans,
+      owner._abandonedPairs, s.band, -1, s.cursor,
+      sliceBudget, AIController.GetTick() + BUILD_TICK_MARGIN);
+
+  local sliceOps = OpexOpsMeasureEnd(mark);
+  if (CATALOG_COST_ACTIVE != null) CATALOG_COST_ACTIVE.airOps += sliceOps;
+  if (CATALOG_COST_ACTIVE != null) {
+    CATALOG_COST_ACTIVE.c121Slices++;
+    CATALOG_COST_ACTIVE.c121LastSliceOps = sliceOps;
+    if (sliceOps > CATALOG_COST_ACTIVE.c121MaxSliceOps)
+      CATALOG_COST_ACTIVE.c121MaxSliceOps = sliceOps;
+    if (s.lastSliceTick == mark.tick) s.tickSlices++;
+    else s.tickSlices = 1;
+    s.lastSliceTick = mark.tick;
+  }
+  s.airOps += sliceOps;
+  s.regenOps += sliceOps;
+  if (!("done" in s.cursor) || !s.cursor.done) {
+    /* Publication progressive : republier des qu'une tranche decoupee enrichit
+     * le vivier (s.plans.len() > s.lastPublishedCount), sans attendre la fin du scan. */
+    if (!s.partialPending && s.plans.len() > s.lastPublishedCount) {
+      s.partialPending = true;
+      s.partialBestPlan = best;
+    }
+    OpexC78RequeueInitialCatalogSlice(owner, task);
+    return false;
+  }
+
+  if (s.phase == "primary" && s.stage == OPEX_STAGE_AIR_ONLY && s.plans.len() == 0) {
+    s.phase = "fallback";
+    s.band = PAX_BAND_AIR_RAIL;
+    s.cursor = {};
+    s.bestPlan = null;
+    OpexC78RequeueInitialCatalogSlice(owner, task);
+    return false;
+  }
+  s.bestPlan = best;
+  s.phase = "apply";
+  OpexC78RequeueInitialCatalogSlice(owner, task);
+  return false;
+}
+
+function OpexAI::_dispatchCatalog(task, year)
+{
+  if (MODE_AIR) {
+    if (this._generationStageMonth < 0)
+      this._generationStageMonth = year * 12 + AIDate.GetMonth(AIDate.GetCurrentDate());
+    C121_CATALOG_FIRST_YEAR_ACTIVE = year == (this._generationStageMonth - 1) / 12
+        && OpexV293AirEngineBuildable()
+        && !(EB14_PROGRESSIVE && this._airBuilt
+            && !(EB14_AIR_ROAD_YEAR_GUARD && MODE_ROAD));
+  }
+  if (C121_CATALOG_TOWN_BATCH_DATE != AIDate.GetCurrentDate()) {
+    C121_CATALOG_TOWN_BATCH_DATE = AIDate.GetCurrentDate();
+    local spTownBatch = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.town_batch") : null;
+    OpexC121CatalogTownProductionBatch(this._catalog);
+    if (spTownBatch != null) OpexSpanEnd(spTownBatch);
+  }
+  local refreshReason = "event";
+  if (("c78AirRebuild" in task) && task.c78AirRebuild != null) {
+    /* Un chantier peut marquer C76 invalide pendant le scan. Le portefeuille
+     * partiel est revalide a l'execution et le scan continue sans redemarrer. */
+    if (task.c78AirRebuild.published)
+      this._portfolioInvalidated = false;
+    if (typeof task.c78AirRebuild == "table"
+        && ("refreshReason" in task.c78AirRebuild)) {
+      refreshReason = task.c78AirRebuild.refreshReason;
+    }
+    if (!V147_IN_PHASE) {
+      /* CD07/B : la phase courante tourne dans sa propre entree de file. */
+      OpexV147ArmPhases(this);
+      if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+      return false;
+    }
+    local spSlice = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.slice") : null;
+    local sliceDone = OpexC78ContinueCatalogAirRebuild(this, task, year);
+    if (spSlice != null) OpexSpanEnd(spSlice);
+    if (!sliceDone) {
+      CATALOG_COST_ACTIVE = null;
+      if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+      return false;
+    }
+  } else {
+  local spGuard = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.guard") : null;
+  local date = AIDate.GetCurrentDate();
+  local ym = year * 12 + AIDate.GetMonth(date);
+  /* Le classement est rejoue uniquement quand son entree change : invalidation
+   * evenementielle ou franchissement du cout du prochain projet connu. */
+  local stale = false;
+  if (this._projects != null) {
+    local spCapital = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.capital") : null;
+    local budgetNow = OpexAvailableCapital();
+    if (spCapital != null) OpexSpanEnd(spCapital);
+    local budgetThen = this._projects.capitalBudget;
+    local gainOk = budgetNow > budgetThen + PORTFOLIO_REFRESH_MIN_GAIN;
+    local doubleOk = budgetNow > budgetThen * 2;
+    if (PORTFOLIO_REFRESH_PROBE) {
+      PORTFOLIO_REFRESH_PROBE_CHECKS++;
+      if (gainOk) PORTFOLIO_REFRESH_PROBE_GAIN_OK++;
+      if (doubleOk) PORTFOLIO_REFRESH_PROBE_DOUBLE_OK++;
+      /* C43/E3 : le seul cas ou PORTFOLIO_REFRESH_MIN_GAIN bloque reellement un rafraichissement
+       * que le doublement aurait seul autorise -- utile seulement si budgetThen < MIN_GAIN. */
+      if (doubleOk && !gainOk) PORTFOLIO_REFRESH_PROBE_DOUBLE_ONLY++;
+    }
+    stale = gainOk && doubleOk;
+  }
+  local c76LayerChanged = false;
+  local c76PeriodicDue = false;
+  local c76ReloadDue = false;
+  local c76CurQuarter = 0;
+  {
+    c76LayerChanged = this._c76AnyLayerChanged();
+    c76CurQuarter = year;
+    c76PeriodicDue = (this._c76LastRegenQuarter < 0 || c76CurQuarter > this._c76LastRegenQuarter);
+    c76ReloadDue = this._c76ForceReloadRegen;
+    local cadenceFresh = this._lastCatalogMonth == ym;
+    if (cadenceFresh && this._projects != null && !stale && !this._portfolioInvalidated
+        && !c76LayerChanged && !c76PeriodicDue && !c76ReloadDue) {
+      if (spGuard != null) OpexSpanEnd(spGuard);
+      if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+      return false;
+    }
+  }
+  if (spGuard != null) OpexSpanEnd(spGuard);
+  refreshReason = this._portfolioInvalidated ? "event"
+      : (stale ? "capital" : (c76ReloadDue ? "reload" : (c76LayerChanged ? "layers" : "event")));
+  if (DECISION_LOG) {
+    OpexDecide("PORTFOLIO_REFRESH", "reason=" + refreshReason + " budget="
+               + OpexAvailableCapital());
+  }
+  this._pruneAbandonedPairs(date);
+  if (PORTFOLIO_REFRESH_PROBE) {
+    local refreshMark = OpexOpsMeasureBegin();
+    this._catalog.refresh(this._budget, year);
+    local refreshOps = OpexOpsMeasureEnd(refreshMark);
+    PORTFOLIO_REFRESH_PROBE_REFRESH_OPS += refreshOps;
+    if (CATALOG_COST_ACTIVE != null) CATALOG_COST_ACTIVE.refreshOps += refreshOps;
+    PORTFOLIO_REFRESH_PROBE_REFRESH_COUNT++;
+  } else {
+    if (CATALOG_COST_ACTIVE != null) {
+      local catalogRefreshMark = OpexOpsMeasureBegin();
+      this._catalog.refresh(this._budget, year);
+      CATALOG_COST_ACTIVE.refreshOps += OpexOpsMeasureEnd(catalogRefreshMark);
+    } else this._catalog.refresh(this._budget, year);
+  }
+  this._advanceRailSearchThroughput();
+  local fleetPlan = null;
+  {
+    /* Mode a blanc : meme decision que la tache air_fleet, sans achat ni test de tresorerie. */
+    fleetPlan = [];
+    this._resizeAirFleets(AIDate.GetYear(AIDate.GetCurrentDate()), fleetPlan);
+  }
+  if (this._recomputeEpochBounds) {
+    OpexRefreshEpochBounds(this._catalog);
+    this._recomputeEpochBounds = false;
+  }
+  {
+    local budgetStale = stale;
+    local c76NeedFullRegen = (this._projects == null) || c76LayerChanged ||
+        this._portfolioInvalidated || budgetStale || c76PeriodicDue || c76ReloadDue;
+    local c80Modes = null;
+    if (c76LayerChanged && this._projects != null
+        && !this._portfolioInvalidated && !budgetStale && !c76PeriodicDue && !c76ReloadDue) {
+      c80Modes = this._c80ModeRegenModes();
+    }
+    if (c80Modes != null) {
+      local modeMark = CATALOG_COST_ACTIVE != null ? OpexOpsMeasureBegin() : null;
+      local spModeRegen = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.mode_regen") : null;
+      this._c80DoModeRegen(c80Modes, "layers", year);
+      if (spModeRegen != null) OpexSpanEnd(spModeRegen);
+      if (CATALOG_COST_ACTIVE != null) {
+        CATALOG_COST_ACTIVE.path = "mode";
+        CATALOG_COST_ACTIVE.modeRegenOps += OpexOpsMeasureEnd(modeMark);
+      }
+    } else if (c76NeedFullRegen) {
+      local c76Reason = c76ReloadDue ? "reload"
+          : (c76LayerChanged ? "layers"
+          : (this._portfolioInvalidated ? "invalidated"
+          : (budgetStale ? "budget"
+          : (c76PeriodicDue ? "periodic" : "initial"))));
+      if (OpexC78StartCatalogAirRebuild(this, task, ym, fleetPlan, refreshReason,
+                                        true, c76CurQuarter, c76Reason)) {
+        CATALOG_COST_ACTIVE = null;
+        if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+        return false;
+      }
+      local c76Mark = C39_INVALIDATION_PROBE ? OpexOpsMeasureBegin() : null;
+      local spRebuild = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.rebuild") : null;
+      this._rebuildProjects(fleetPlan);
+      if (spRebuild != null) OpexSpanEnd(spRebuild);
+      this._advanceRailSearchThroughput();
+      if (C39_INVALIDATION_PROBE) {
+        local c76Ops = OpexOpsMeasureEnd(c76Mark);
+        local c76Days = (c76Ops + 93000) / 186000;
+        this._c76RecordRegen("full", c76Ops, c76Days, year, c76Reason);
+      }
+      this._c76AcknowledgeAllLayers();
+      this._c76LastRegenQuarter = c76CurQuarter;
+      this._c76ForceReloadRegen = false;
+    } else {
+      // Regeneration evitee : reselection du vivier existant sous capital courant
+      local reselectMark = CATALOG_COST_ACTIVE != null ? OpexOpsMeasureBegin() : null;
+
+      local budgetNow = OpexAvailableCapital();
+      this._projects = OpexReselectProjects(
+          this._projects, budgetNow, this._abandonedPairs, this._lines);
+
+      this._c76RecordAvoided(year);
+      if (CATALOG_COST_ACTIVE != null) {
+        CATALOG_COST_ACTIVE.path = "reselect";
+        CATALOG_COST_ACTIVE.reselectOps += OpexOpsMeasureEnd(reselectMark);
+        CATALOG_COST_ACTIVE.considered = this._projects.stats.budgetConsidered;
+        CATALOG_COST_ACTIVE.selected = this._projects.best.len();
+      }
+    }
+  }
+  this._lastCatalogMonth = ym;
+  }
+  this._advanceRailSearchThroughput();
+  /* C39.5 : le vivier vient d'etre (re)genere. Horodater ici, et pas seulement au prochain
+   * tour projects, pour que D2 mesure toute la fenetre de financabilite. */
+  if (C39_PROJECTS_CADENCE_PROBE) this._c39StampFinanceable();
+  if (this._catalog != null && this._catalog.bounds != null) {
+    local b = this._catalog.bounds;
+    OpexSign(AIMap.GetTileIndex(1, 2), "EB|" + b.roadMin + "|" + b.railMin
+             + "|" + b.railAirOverlapMin + "|" + b.railMax);
+  }
+  if ((C41_ROAD_CANDIDATE_PROFILE || C41_ROAD_FREIGHT_PROFILE || C41_ROAD_FREIGHT_TOWN_PROFILE) && this._projects != null && ("road" in this._projects) &&
+      this._projects.road != null && ("profile" in this._projects.road) &&
+      this._projects.road.profile != null) {
+    local profile = this._projects.road.profile;
+    if (C41_ROAD_CANDIDATE_PROFILE) {
+      OpexC39Log("C41_ROAD_CANDIDATE_PROFILE", "ops=" + this._projects.road.opcodes
+                 + " pax_ops=" + profile.paxOps + " freight_ops=" + profile.freightOps
+                 + " topk_ops=" + profile.topKOps
+                 + " candidates=" + this._projects.road.all);
+    }
+    if (C41_ROAD_FREIGHT_PROFILE) {
+      OpexC39Log("C41_ROAD_FREIGHT_PROFILE", "road_ops=" + this._projects.road.opcodes
+                 + " preparation_ops=" + profile.freightPreparationOps
+                 + " industry_ops=" + profile.freightIndustryOps
+                 + " town_ops=" + profile.freightTownOps
+                 + " candidates=" + this._projects.road.all);
+    }
+    if (C41_ROAD_FREIGHT_TOWN_PROFILE) {
+      OpexC39Log("C41_ROAD_FREIGHT_TOWN_PROFILE", "road_ops=" + this._projects.road.opcodes
+                 + " scanned=" + profile.freightTownScanned
+                 + " acceptance_hits=" + profile.freightTownAcceptanceHits
+                 + " acceptance_misses=" + profile.freightTownAcceptanceMisses
+                 + " acceptance_ops=" + profile.freightTownAcceptanceOps
+                 + " accepted_pairs=" + profile.freightTownAcceptedPairs
+                 + " candidate_ops=" + profile.freightTownCandidateOps);
+    }
+  }
+  if (C41_RAIL_PORTFOLIO_PROFILE && this._projects != null && ("stats" in this._projects)
+      && this._projects.stats != null && ("railProfile" in this._projects.stats)) {
+    local railProfile = this._projects.stats.railProfile;
+    OpexC39Log("C41_RAIL_PORTFOLIO_PROFILE", "generation_ops=" + railProfile.generationOps
+               + " generation_candidates=" + railProfile.generationCandidates
+               + " topk_candidates=" + railProfile.topKCandidates
+               + " insert_ops=" + railProfile.insertOps
+               + " inserted_projects=" + railProfile.insertedProjects
+               + " selection_ops=" + this._projects.stats.selectionOpcodes
+               + " selection_considered=" + this._projects.stats.budgetConsidered
+               + " selection_selected=" + this._projects.stats.budgetSelected);
+  }
+  if (C41_RAIL_CANDIDATE_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_CANDIDATE_PROFILE", "ops=" + this._projects.rail.opcodes
+               + " pax_ops=" + profile.paxOps + " freight_ops=" + profile.freightOps
+               + " topk_ops=" + profile.topKOps + " candidates=" + this._projects.rail.all);
+  }
+  if (C41_RAIL_PAX_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_PAX_PROFILE", "preparation_ops=" + profile.paxPreparationOps
+               + " pair_total_ops=" + profile.paxPairTotalOps
+               + " candidate_ops=" + profile.paxCandidateOps
+               + " pairs_scanned=" + profile.paxPairsScanned
+               + " candidate_calls=" + profile.paxCandidateCalls
+               + " candidates=" + this._projects.rail.all);
+  }
+  if (C41_RAIL_PAX_CANDIDATE_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_PAX_CANDIDATE_PROFILE", "sitable_ops=" + profile.paxSitableOps
+               + " sitable_calls=" + profile.paxSitableCalls
+               + " economics_ops=" + profile.paxEconomicsOps
+               + " economics_calls=" + profile.paxEconomicsCalls);
+  }
+  if (C41_RAIL_PAX_ECONOMICS_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_PAX_ECONOMICS_PROFILE", "total_ops=" + profile.paxEconomicsOps
+               + " calls=" + profile.paxEconomicsCalls
+               + " setup_ops=" + profile.paxEconomicsSetupOps
+               + " loop_ops=" + profile.paxEconomicsLoopOps
+               + " loop_calls=" + profile.paxEconomicsLoopCalls
+               + " post_ops=" + profile.paxEconomicsPostOps);
+  }
+  if (C41_RAIL_PAX_SPEED_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_PAX_SPEED_PROFILE", "setup_ops=" + profile.paxEconomicsSetupOps
+               + " speed_ops=" + profile.paxSpeedOps
+               + " speed_calls=" + profile.paxSpeedCalls
+               + " corrected_speed_calls=" + profile.paxCorrectedSpeedCalls);
+  }
+  if (C41_RAIL_PAX_SPEED_DETAIL_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_PAX_SPEED_DETAIL_PROFILE", "cruise_ops=" + profile.paxCruiseOps
+               + " acceleration_ops=" + profile.paxAccelerationOps
+               + " integration_ops=" + profile.paxIntegrationOps
+               + " speed_calls=" + profile.paxSpeedCalls
+               + " unique_keys=" + profile.paxSpeedUniqueKeys
+               + " cacheable_hits=" + profile.paxSpeedCacheableHits);
+  }
+  if (C41_RAIL_PAX_CRUISE_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_PAX_CRUISE_PROFILE", "cruise_ops=" + profile.paxCruiseOps
+               + " cruise_calls=" + profile.paxCruiseCalls
+               + " unique_keys=" + profile.paxCruiseUniqueKeys
+               + " cacheable_hits=" + profile.paxCruiseCacheableHits);
+  }
+  if (C41_RAIL_FREIGHT_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_PROFILE", "preparation_ops=" + profile.freightPreparationOps
+               + " industry_ops=" + profile.freightIndustryOps
+               + " town_ops=" + profile.freightTownOps);
+  }
+  if (C41_RAIL_FREIGHT_CANDIDATE_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_CANDIDATE_PROFILE", "industry_ops=" + profile.freightIndustryOps
+               + " industry_candidate_ops=" + profile.freightIndustryCandidateOps
+               + " industry_candidate_calls=" + profile.freightIndustryCandidateCalls
+               + " town_ops=" + profile.freightTownOps
+               + " town_candidate_ops=" + profile.freightTownCandidateOps
+               + " town_candidate_calls=" + profile.freightTownCandidateCalls);
+  }
+  if (C41_RAIL_FREIGHT_ECONOMICS_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail)
+      && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_ECONOMICS_PROFILE", "ops=" + profile.freightEconomicsOps
+               + " calls=" + profile.freightEconomicsCalls);
+  }
+  if (C41_RAIL_FREIGHT_ECONOMICS_DETAIL_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail) && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_ECONOMICS_DETAIL_PROFILE", "ops=" + profile.freightEconomicsOps
+               + " calls=" + profile.freightEconomicsCalls
+               + " setup_ops=" + profile.freightEconomicsSetupOps
+               + " setup_calls=" + profile.freightEconomicsSetupCalls
+               + " loop_ops=" + profile.freightEconomicsLoopOps
+               + " loop_calls=" + profile.freightEconomicsLoopCalls
+               + " post_ops=" + profile.freightEconomicsPostOps
+               + " post_calls=" + profile.freightEconomicsPostCalls);
+  }
+  if (C41_RAIL_FREIGHT_ECONOMICS_SETUP_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail) && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_ECONOMICS_SETUP_PROFILE", "ops=" + profile.freightEconomicsOps
+               + " calls=" + profile.freightEconomicsCalls
+               + " reference_ops=" + profile.freightEconomicsReferenceOps
+               + " reference_calls=" + profile.freightEconomicsReferenceCalls
+               + " consist_ops=" + profile.freightEconomicsConsistOps
+               + " consist_calls=" + profile.freightEconomicsConsistCalls
+               + " capital_ops=" + profile.freightEconomicsCapitalOps
+               + " capital_calls=" + profile.freightEconomicsCapitalCalls);
+  }
+  if (C41_RAIL_FREIGHT_ECONOMICS_CONSIST_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail) && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_ECONOMICS_CONSIST_PROFILE", "ops=" + profile.freightEconomicsOps
+               + " initial_speed_ops=" + profile.freightEconomicsConsistInitialSpeedOps
+               + " initial_speed_calls=" + profile.freightEconomicsConsistInitialSpeedCalls
+               + " corrected_speed_ops=" + profile.freightEconomicsConsistCorrectedSpeedOps
+               + " corrected_speed_calls=" + profile.freightEconomicsConsistCorrectedSpeedCalls);
+  }
+  if (C41_RAIL_FREIGHT_CRUISE_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail) && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_CRUISE_PROFILE", "cruise_calls=" + profile.freightCruiseCalls
+               + " unique_keys=" + profile.freightCruiseUniqueKeys
+               + " cacheable_hits=" + profile.freightCruiseCacheableHits);
+  }
+  if (C41_RAIL_FREIGHT_SPEED_DETAIL_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail) && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_SPEED_DETAIL_PROFILE", "acceleration_ops=" + profile.freightAccelerationOps
+               + " acceleration_calls=" + profile.freightAccelerationCalls
+               + " integration_ops=" + profile.freightIntegrationOps
+               + " integration_calls=" + profile.freightIntegrationCalls);
+  }
+  if (C41_RAIL_FREIGHT_EFFECTIVE_SPEED_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail) && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_EFFECTIVE_SPEED_PROFILE", "calls=" + profile.freightSpeedCalls
+               + " unique_keys=" + profile.freightSpeedUniqueKeys + " cacheable_hits=" + profile.freightSpeedCacheableHits);
+  }
+  if (C41_RAIL_FREIGHT_TOWN_GUARDS_PROFILE && this._projects != null && ("rail" in this._projects)
+      && this._projects.rail != null && ("profile" in this._projects.rail) && this._projects.rail.profile != null) {
+    local profile = this._projects.rail.profile;
+    OpexC39Log("C41_RAIL_FREIGHT_TOWN_GUARDS_PROFILE", "ops=" + profile.freightTownGuardsOps + " calls=" + profile.freightTownGuardsCalls + " service_ops=" + profile.freightTownServiceOps + " service_calls=" + profile.freightTownServiceCalls);
+  }
+  this._logStalenessRefresh(refreshReason);
+  this._portfolioInvalidated = false;
+  this._ranked = this._projects.rail;
+  if (PORTFOLIO_LOG) {
+    if (this._projects != null && this._projects.best != null && this._projects.best.len() > 0) {
+      OpexLogPortfolioRank(this._projects);
+    } else if (DECISION_LOG) {
+      local cBudget = (this._projects != null) ? this._projects.capitalBudget : 0;
+      OpexDecide("PORTFOLIO_EMPTY", "budget=" + cBudget);
+    }
+  }
+  local anchor = AIMap.GetTileIndex(1, 1);
+  local yy = year % 100;
+  /* M1 : knapsackExact est un slot legacy de compatibilite. Aucun solveur knapsack/B&B n'existe
+   * dans le chemin courant ; projects.nut le force donc a false afin de ne jamais publier un
+   * " optimum prouve " fictif. */
+  /* Dernier champ : cout reel de CETTE selection en milliers d'opcodes.
+   * On reutilise IG au lieu d'ajouter un BuildSign : la sonde H5 ne doit pas
+   * creer elle-meme une tache/signature CPU supplementaire. */
+  OpexSign(anchor, "IG|" + yy + "|" + this._projects.stats.modeCandidates + "|"
+           + this._projects.stats.odProjects + "|" + this._projects.stats.budgetSelected
+           + "|" + (this._projects.stats.knapsackExact ? 0 : 1)
+           + "|" + this._budget.nested + "|" + (this._projects.stats.selectionOpcodes / 1000));
+  /* Meme schema que task_projects : le 3e champ reste le capital du pool de selection legacy.
+   * Cette tache ne construit rien elle-meme, donc B0 est exact. */
+  OpexSign(anchor, "IB|" + yy + "|" + this._projects.capitalBudget + "|"
+           + this._projects.stats.selectedCapital + "|B0");
+  if (CATALOG_COST_ACTIVE != null) {
+    OpexCatalogCostLog(CATALOG_COST_ACTIVE);
+    delete task.catalogCost;
+    CATALOG_COST_ACTIVE = null;
+  }
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return true;
+}
+function OpexAI::_dispatchC41RailSignals(task, year)
+{
+  task.dueCycle = 2147483647;
+  if (!C41_RAIL_LOST_SIGNAL_REPAIR || this._c41RailSignalLines == null) {
+    if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return false;
+  }
+  local lineId = -1;
+  foreach (pendingLine, ignored in this._c41RailSignalLines) { lineId = pendingLine.tointeger(); break; }
+  if (lineId < 0) { task.enabled = false; if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle); return false; }
+  delete this._c41RailSignalLines["" + lineId];
+  local line = this._findLineById(lineId);
+  if (line == null || !("mode" in line) || line.mode != "rail" ||
+      !("doubleTrack" in line) || line.doubleTrack != 1) {
+    OpexC41RailSignalRepairLog("C41_RAIL_SIGNAL_REPAIR", "line=" + lineId + " status=stale");
+    if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return false;
+  }
+  local a = OpexC41BuildPbsAtApproach(("platformA" in line) ? line.platformA : null);
+  local b = OpexC41BuildPbsAtApproach(("platformB" in line) ? line.platformB : null);
+  local a2 = OpexC41BuildPbsAtApproach(("platformA2" in line) ? line.platformA2 : null,
+                                       ("stationA2" in line) ? line.stationA2 : null);
+  local b2 = OpexC41BuildPbsAtApproach(("platformB2" in line) ? line.platformB2 : null,
+                                       ("stationB2" in line) ? line.stationB2 : null);
+  OpexC41RailSignalRepairLog("C41_RAIL_SIGNAL_REPAIR", "line=" + lineId + " a=" + a + " b=" + b
+                             + " a2=" + a2 + " b2=" + b2);
+  if (this._c41RailSignalLines.len() > 0) task.dueCycle = this._taskCycle + 1;
+  else task.enabled = false;
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return a == 1 || b == 1 || a2 == 1 || b2 == 1;
+}
+function OpexAI::_dispatchC41RailJunction(task, year)
+{
+  task.dueCycle = 2147483647;
+  if (!C41_RAIL_LOST_JUNCTION_REPAIR || this._c41RailJunctionLines == null) {
+    if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return false;
+  }
+  local lineId = -1;
+  foreach (pendingLine, ignored in this._c41RailJunctionLines) { lineId = pendingLine.tointeger(); break; }
+  if (lineId < 0) { task.enabled = false; if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle); return false; }
+  delete this._c41RailJunctionLines["" + lineId];
+  local line = this._findLineById(lineId);
+  if (line == null || !("mode" in line) || line.mode != "rail" ||
+      !("doubleTrack" in line) || line.doubleTrack != 1) {
+    OpexC41RailJunctionRepairLog("C41_RAIL_JUNCTION_REPAIR", "line=" + lineId + " status=stale");
+    if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return false;
+  }
+  local exitA = ("platformA" in line && line.platformA != null && ("station_exit" in line.platformA)) ? line.platformA.station_exit : null;
+  local exitB = ("platformB" in line && line.platformB != null && ("station_exit" in line.platformB)) ? line.platformB.station_exit : null;
+  local leadA = OpexC41RailApproachLead(("platformA" in line) ? line.platformA : null);
+  local leadB = OpexC41RailApproachLead(("platformB" in line) ? line.platformB : null);
+  local leadA2 = OpexC41RailApproachLead(("platformA2" in line) ? line.platformA2 : null,
+                                         ("stationA2" in line) ? line.stationA2 : null);
+  local leadB2 = OpexC41RailApproachLead(("platformB2" in line) ? line.platformB2 : null,
+                                         ("stationB2" in line) ? line.stationB2 : null);
+  local a = OpexC41RepairJunction(leadA, exitA);
+  local b = OpexC41RepairJunction(leadB, exitB);
+  local a2 = OpexC41RepairJunction(leadA2, ("stationA2" in line) ? line.stationA2 : null);
+  local b2 = OpexC41RepairJunction(leadB2, ("stationB2" in line) ? line.stationB2 : null);
+  local depot = ("depot" in line) ? line.depot : null;
+  local front = (depot != null && AIMap.IsValidTile(depot) && AIRail.IsRailDepotTile(depot))
+      ? AIRail.GetRailDepotFrontTile(depot) : null;
+  local depotRepair = OpexC41RepairJunction(front, depot);
+  local depot2 = ("depot2" in line) && line.depot2 != null ? line.depot2 : -1;
+  local front2 = (AIMap.IsValidTile(depot2) && AIRail.IsRailDepotTile(depot2))
+      ? AIRail.GetRailDepotFrontTile(depot2) : null;
+  local depot2Repair = OpexC41RepairJunction(front2, depot2);
+  OpexC41RailJunctionRepairLog("C41_RAIL_JUNCTION_REPAIR", "line=" + lineId + " a=" + a + " b=" + b
+                               + " a2=" + a2 + " b2=" + b2 + " depot=" + depotRepair + " depot2=" + depot2Repair);
+  if (this._c41RailJunctionLines.len() > 0) task.dueCycle = this._taskCycle + 1;
+  else task.enabled = false;
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return a == 1 || b == 1 || a2 == 1 || b2 == 1 || depotRepair == 1 || depot2Repair == 1;
+}
+function OpexAI::_dispatchReport(task, year)
+{
+  if (this._lastReportYear == year) { if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle); return false; }
+  this._lastReportYear = year;
+  this._ensureSelection();
+  if (DECISION_LOG) {
+    local bank = AICompany.GetBankBalance(AICompany.COMPANY_SELF);
+    local loan = AICompany.GetLoanAmount();
+    OpexDecide("REPORT", "year=" + year + " lines=" + this._lines.len() + " bank=" + bank + " loan=" + loan);
+    this._logAirLazySelect(year);
+  }
+  OpexSign(AIMap.GetTileIndex(1, 1), "LB|" + (year % 100) + "|"
+           + AICompany.GetBankBalance(AICompany.COMPANY_SELF));
+  /* Diagnostic passif de tresorerie sous probe_portfolio. Les quatre panneaux
+   * sont volontairement compacts (< 31 caracteres) pour etre relus depuis le
+   * chunk SIGN sans dependre du journal stdout d'OpenTTD. Ils sont publies
+   * avant _logC49ScarcityLedger(), qui remet le registre annuel a zero. */
+  if (C49_SCARCITY_LEDGER) {
+    local ucCash = AICompany.GetBankBalance(AICompany.COMPANY_SELF);
+    local ucLoan = AICompany.GetLoanAmount();
+    local ucAvail = OpexAvailableCapital();
+    local ucHeadNeed = -1;
+    local ucHeadMode = "none";
+    if (this._projects != null && this._projects.best != null && this._projects.best.len() > 0
+        && this._projects.best[0] != null) {
+      local ucHead = this._projects.best[0];
+      ucHeadNeed = OpexProjectFinanceCapital(ucHead);
+      if (("mode" in ucHead) && ucHead.mode != null) ucHeadMode = ucHead.mode;
+    }
+    local ucRailPhase = 0;
+    local ucRailNeed = -1;
+    if (this._railSearch != null) {
+      ucRailPhase = (("phase" in this._railSearch) && this._railSearch.phase == "build") ? 2 : 1;
+      if (("candidate" in this._railSearch) && this._railSearch.candidate != null
+          && ("capital" in this._railSearch.candidate)) {
+        ucRailNeed = this._railSearch.candidate.capital;
+      }
+    }
+    OpexSign(AIMap.GetTileIndex(2, 1), "UC|" + (year % 100) + "|" + ucCash + "|" + ucLoan + "|0");
+    OpexSign(AIMap.GetTileIndex(2, 2), "UP|" + (year % 100) + "|" + ucAvail + "|" + ucHeadNeed + "|" + ucHeadMode);
+    OpexSign(AIMap.GetTileIndex(2, 3), "UR|" + (year % 100) + "|" + ucRailPhase + "|" + ucRailNeed);
+    if (this._c49ScarcityLedger != null) {
+      local ucDecision = this._c49ScarcityLedger.decision_attempted + this._c49ScarcityLedger.decision_unattempted;
+      OpexSign(AIMap.GetTileIndex(2, 4), "US|" + (year % 100) + "|" + this._c49ScarcityLedger.cash
+               + "|" + this._c49ScarcityLedger.site + "|" + ucDecision + "|" + this._c49ScarcityLedger.none);
+      OpexSign(AIMap.GetTileIndex(2, 5), "UT|" + (year % 100) + "|" + this._c49ScarcityLedger.stop_k_pass
+               + "|" + this._c49ScarcityLedger.stop_cash + "|" + this._c49ScarcityLedger.stop_rail_search
+               + "|" + this._c49ScarcityLedger.stop_list_end + "|" + this._c49ScarcityLedger.stop_other);
+    }
+    if (C75_YEAR_LEDGER != null) {
+      OpexSign(AIMap.GetTileIndex(2, 6), "UB|" + (year % 100) + "|" + C75_YEAR_LEDGER.passes
+               + "|" + C75_YEAR_LEDGER.builds + "|" + C75_YEAR_LEDGER.multi_passes);
+    }
+  }
+  if (PORTFOLIO_REFRESH_PROBE) {
+    local checks = PORTFOLIO_REFRESH_PROBE_CHECKS - this._portfolioRefreshProbeLastChecks;
+    local gainOk = PORTFOLIO_REFRESH_PROBE_GAIN_OK - this._portfolioRefreshProbeLastGainOk;
+    local doubleOk = PORTFOLIO_REFRESH_PROBE_DOUBLE_OK - this._portfolioRefreshProbeLastDoubleOk;
+    local doubleOnly = PORTFOLIO_REFRESH_PROBE_DOUBLE_ONLY - this._portfolioRefreshProbeLastDoubleOnly;
+    this._portfolioRefreshProbeLastChecks = PORTFOLIO_REFRESH_PROBE_CHECKS;
+    this._portfolioRefreshProbeLastGainOk = PORTFOLIO_REFRESH_PROBE_GAIN_OK;
+    this._portfolioRefreshProbeLastDoubleOk = PORTFOLIO_REFRESH_PROBE_DOUBLE_OK;
+    this._portfolioRefreshProbeLastDoubleOnly = PORTFOLIO_REFRESH_PROBE_DOUBLE_ONLY;
+    local refreshOps = PORTFOLIO_REFRESH_PROBE_REFRESH_OPS - this._portfolioRefreshProbeLastRefreshOps;
+    local refreshCount = PORTFOLIO_REFRESH_PROBE_REFRESH_COUNT - this._portfolioRefreshProbeLastRefreshCount;
+    this._portfolioRefreshProbeLastRefreshOps = PORTFOLIO_REFRESH_PROBE_REFRESH_OPS;
+    this._portfolioRefreshProbeLastRefreshCount = PORTFOLIO_REFRESH_PROBE_REFRESH_COUNT;
+    OpexPortfolioRefreshProbeLog("year=" + year + " checks=" + checks + " gain_ok=" + gainOk
+                                 + " double_ok=" + doubleOk + " double_only=" + doubleOnly
+                                 + " refresh_ops=" + refreshOps + " refresh_count=" + refreshCount);
+  }
+  /* C41.11 : le rapport exclut son propre cout, publie au plus une fois par an. */
+  this._logC41SlackLedger(year);
+  this._logC41OpportunityLedger(year);
+  this._logC41AdmissionLedger(year);
+  this._logC41RailSliceLedger(year);
+  this._logC39PassClockLedger(year);
+  this._logC89AnnualRail(year);
+  if (C49_SCARCITY_LEDGER) this._logC49ScarcityLedger(year);
+  if (C55_ORIGIN_RELAX_PROBE) this._logC55OriginRelaxLedger(year);
+  if (C52_AUTOREPLACE_LOG) this._logC52AutoreplaceLedger(year);
+  if (C52_EVENT_EXPOSURE_PROBE) this._logC52EventExposureLedger(year);
+  if (C54_VEHICLE_ORDERS_PROBE) this._logC54VehicleOrders(year);
+  if (C60_TOWN_RATING_PROBE) this._logC60TownRatingLedger(year);
+  if (C50_CHRONOLOGY_PROBE) this._logC50AnnualReport(year);
+  local spReportYear = PROBE_SPAN_TRACE ? OpexSpanBegin("report.year") : null;
+  this._reportYear(year, this._ranked);
+  if (spReportYear != null) OpexSpanEnd(spReportYear);
+  local spReportLines = PROBE_SPAN_TRACE ? OpexSpanBegin("report.lines") : null;
+  this._reportLines(year);
+  if (spReportLines != null) OpexSpanEnd(spReportLines);
+  if (C63_INVEST_PROBE) OpexC63EnsureYear(year);
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return true;
+}
+function OpexAI::_dispatchScrap(task, year)
+{
+  local spScrap = PROBE_SPAN_TRACE ? OpexSpanBegin("scrap.rollback") : null;
+  OpexAirProcessRollbacks(this._lines);
+  if (spScrap != null) OpexSpanEnd(spScrap);
+  spScrap = PROBE_SPAN_TRACE ? OpexSpanBegin("scrap.lines") : null;
+  this._scrapDeadLines(year);
+  if (spScrap != null) OpexSpanEnd(spScrap);
+  spScrap = PROBE_SPAN_TRACE ? OpexSpanBegin("scrap.vehicles") : null;
+  this._scrapRetiredVehicles(year);
+  if (spScrap != null) OpexSpanEnd(spScrap);
+  spScrap = PROBE_SPAN_TRACE ? OpexSpanBegin("scrap.streaks") : null;
+  this._purgeUnprofitableStreaks();
+  if (spScrap != null) OpexSpanEnd(spScrap);
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return true;
+}
+function OpexAI::_dispatchAir(task, year)
+{
+  /* C34.1 : sous air_portfolio, la construction aerienne passe EXCLUSIVEMENT par le portefeuille.
+   * Motif mesure (docs/taches.md 0 novemquinquagesies) : OpexAirPlans est appele DEUX fois par
+   * cycle -- une fois ici (main.nut:971) et une fois dans OpexBuildProjects (projects.nut:693) --
+   * et chaque passage coute ~21 jours de temps de jeu. Sur la graine 1, 11 passages ont mange
+   * 63 % de l'annee 1. Eteindre cette tache supprime la moitie du goulot, et l'executeur du
+   * portefeuille sait deja batir mode == "air" (main.nut:1839). */
+  task.enabled = false;
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return false;
+}
+function OpexAI::_dispatchAirFleet(task, year)
+{
+  /* C34.2 / C36.2 : sous fleet_portfolio, la croissance de flotte est arbitree par le portefeuille.
+   * La tache dediee ne depense plus a l'aveugle, mais inspecte la flotte et injecte
+   * les opportunites mures dans le vivier incremental du portefeuille sans attendre un an. */
+  task.dueCycle = this._taskCycle + 1;
+  {
+    if (this._projects != null) {
+      local fleetPlan = [];
+      this._resizeAirFleets(year, fleetPlan);
+      local airCount = fleetPlan.len();
+      if (airCount > 0) {
+        local budgetNow = OpexAvailableCapital();
+        local spInject = PROBE_SPAN_TRACE ? OpexSpanBegin("fleet.inject") : null;
+        this._projects = OpexInjectFleetProjects(this._projects, fleetPlan, this._abandonedPairs, budgetNow, this._lines);
+        if (spInject != null) OpexSpanEnd(spInject);
+        this._ranked = this._projects.rail;
+      }
+    }
+    if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return false;
+  }
+
+}
+
+function OpexAI::_dispatchProjects(task, year)
+{
+  this._ensureSelection();
+  /* Si l'evenement est arrive apres le passage catalog dans le cycle courant, attendre
+   * sa reconstruction plutot que de choisir une ligne dans le vivier devenu obsolete. */
+  if (C39_PROJECTS_CADENCE_PROBE) {
+    local date = AIDate.GetCurrentDate();
+    local tick = AIController.GetTick();
+    /* C39.5b : un seul OpexAvailableCapital() par dispatch -- reutilise pour le comptage
+     * financable ET pour le champ capital= ci-dessous, au lieu de l'appeler deux fois pour la
+     * meme valeur. isProjectsTurn=true : c'est le seul site qui doit avancer turns/topTurns. */
+    local capitalNow = OpexAvailableCapital();
+    local financeable = this._c39StampFinanceable(capitalNow, true);
+    OpexC39ProjectsCadenceLog("phase=dispatch days_since_last="
+        + (this._c39CadenceLastDate >= 0 ? date - this._c39CadenceLastDate : -1)
+        + " ticks_since_last="
+        + (this._c39CadenceLastTick >= 0 ? tick - this._c39CadenceLastTick : -1)
+        + " cycles_since_last="
+        + (this._c39CadenceLastCycle >= 0 ? this._taskCycle - this._c39CadenceLastCycle : -1)
+        + " rail_search=" + (this._railSearch != null ? 1 : 0)
+        + " rail_phase=" + (this._railSearch != null ? this._railSearch.phase : "-")
+        + " rail_kind=" + (this._railSearch != null ? this._railSearch.kind : "-")
+        + " invalidated=" + (this._portfolioInvalidated ? 1 : 0)
+        + " best_len=" + (this._projects != null ? this._projects.best.len() : -1)
+        + " capital=" + capitalNow + " financeable=" + financeable);
+    this._c39CadenceLastDate = date;
+    this._c39CadenceLastTick = tick;
+    this._c39CadenceLastCycle = this._taskCycle;
+  }
+  if (this._portfolioInvalidated) {
+    if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return false;
+  }
+  if (C56_TASK_TRACE) {
+    local builtProjects = this._tryBuildProjects(year);
+    OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+    return builtProjects;
+  }
+  return this._tryBuildProjects(year);
+}
+function OpexAI::_dispatchExpand(task, year)
+{
+
+  /* G6S1 : le bloc RAIL_REFLEET (second train, double voie) vit dans _expandRailLines. */
+
+  if (PFIX_CATALOG_MODE_CUT) {
+    if (MODE_RAIL) this._expandRailLines(year);
+  } else {
+    this._expandRailLines(year);
+  }
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return true;
+}
+function OpexAI::_dispatchRefleet(task, year)
+{
+  if (ROAD1Y_SPREAD_STOPS > 0) OpexRoad1ySpreadStep(this);
+  this._refleetRoadLines(year);
+  if (ROAD1Y_WEAK > 0) OpexRoad1yWeakStep(this, year);
+  if (PFIX_CATALOG_MODE_CUT) {
+    if (MODE_WATER) this._refleetCrashedWaterLines(year);
+  } else {
+    this._refleetCrashedWaterLines(year);
+  }
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return true;
+}
+
+function OpexAI::_dispatchRepay(task, year)
+{
+  local date = AIDate.GetCurrentDate();
+  local ym = year * 12 + AIDate.GetMonth(date);
+  if (this._lastRepayMonth == ym) { if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle); return false; }
+  this._lastRepayMonth = ym;
+  this._tryRepayLoan(year);
+  this._v292TryBuildHq(year);
+  if (C56_TASK_TRACE) OpexC56TaskLog("TASK_EXIT", task.name, this._taskCycle);
+  return true;
+}

@@ -1,0 +1,802 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 jrdoublet
+/* C65 passe 2 : globales du bloc AVANT require(budget/catalog/...). */
+/* Declare avant les require() : catalog.nut consulte ce drapeau dans son cycle annuel. Repli
+ * actif jusqu'a la lecture unique de road_mode dans Start(), comme les autres reglages de
+ * decision. Le defaut vrai est celui de info.nut ; 0 reconstitue la baseline sans route, dont le
+ * chemin d'opcodes reste alors EXACTEMENT celui des campagnes anterieures. */
+ROAD_BUILD_ENABLED <- true;
+/* V166 : interrupteurs de mode (bancs mono-mode, rail contre rail, air contre air). Un mode a faux
+ * ne genere ni candidat ni balayage de catalogue et ne construit rien ; les quatre a vrai = defaut. */
+MODE_AIR <- true;
+MODE_RAIL <- true;
+MODE_ROAD <- true;
+MODE_WATER <- true;
+/* MULTI-1 : promotion experimentale d'une ROUTE deja qualifiee ; 0 preserve strictement l'election. */
+MULTI1_ROAD_PRIORITY <- 0;
+/* MULTI-1 second pilot: bounded AIR-over-unprepared-RAIL selection, off by default. */
+MULTI1_AIR_OVER_RAIL <- 0;
+/* MULTI-1 third pilot: bounded ROAD detours after all historical traces fail. */
+MULTI1_ROAD_DETOUR <- 0;
+/* MULTI-1: passive secondary ROAD freight study. Never enters a real portfolio. */
+MULTI1_ROAD_CARGO_SHADOW <- 0;
+MULTI1_ROAD_CARGO_PENDING <- null;
+MULTI1_ROAD_CARGO_LAST_MONTH <- -1;
+/* V168 : borne de distance des candidats rail. 160 = defaut (portes A et B du 13/10) ; 0 = derivee
+ * du plafond d'A* par la table de noeuds (94 tuiles a 10k) ; N = N tuiles, sans le filtre
+ * d'iterations predites. */
+V168_RAIL_MAX_DIST <- 160;
+/* V269 : relachement tardif du vivier rail (orchestrator.nut, _v217RailRefill). 0 = inerte,
+ * N = annees apres le depart (defaut 5 depuis le 20/10, decision utilisateur apres le 40x10
+ * GitHub +83,1 k, 24/16, IC95 [-8 k ; +174 k]). Quand le vivier est vide et la caisse oisive,
+ * la regeneration V217 accepte le fret jusqu'a V269_RAIL_MAX_DIST tuiles. */
+V269_RAIL_LATE_RELAX <- 5;
+V269_RAIL_MAX_DIST <- 250;
+V269_IDLE_CASH_MIN <- 1000000;
+/* V286 : instantanes de flux RAIL, reglage independent OFF au defaut. */
+V286_FLOW_PROBE <- false;
+V286_FLOW_LAST_DAY <- -1;
+V286_FLOW_CURSOR <- 0;
+/* V309 : sondage passif des tours en attente, sans changer l'ordonnanceur. */
+V309_IDLE_PROBE <- false;
+V309_IDLE_STATE <- null;
+FRONT_PAX1_CLAMP_PROBE <- false; // Reglage independant, motifs des bornes PASS.
+V284_RAIL_GROWTH <- 0; // 0 : master ; N : croissance fret apres N ans et 1 MGBP disponible.
+V233_LONG_GOOD <- 1; // Defaut 1 depuis le 27/10 (decision utilisateur).
+V233L_CONSTRUCT <- 0; // 0 historique, 1 devis monovoie passif, 2 repli monovoie physique opt-in.
+V233L_STATE <- null; // Fenetres mensuelles entieres, sauvegardees seulement sous l'option.
+V233_SITE_FUNNEL <- 1; // 0 = spirale B urbaine ; 1 = entonnoir natif (defaut 1 depuis le 27/10).
+V233_FUNNEL_CENTER_TEST <- 1; // 0 = off ; 1 = pre-test d'acceptation au centre de la ville.
+/* V294 : ponts/tunnels longs (fige a 20 le 18/11, defaut V294all du 21/10). La recherche A*
+ * continue V294b est retiree le 20/11. */
+const V294_RAIL_BRIDGE_LEN = 20;
+V269_RELAXED <- false;
+V269_ON <- false;
+ROAD1Y_LOAD_ORDERS <- false; // ROAD1Y : alignement ordres AAAHogEx (dest fret UNLOAD|NO_LOAD, source pax FULL_LOAD_ANY)
+/* DIST-BORNES-1 : experiment V276 fret tardif, OFF sur tous les profils. */
+DIST_BORNES_V276_FREIGHT <- false;
+/* DIST-BORNES-1 : table unique des fenetres modales, opt-in strictement OFF. */
+DIST_BORNES_UNIFIED <- false;
+/* ROAD100 : generation de bus autonome strictement en ROAD seul ; 0 = historique. */
+ROAD100_SOLO_PAX <- true; // ROAD100 : candidats PAX route seule (active par defaut sur cette branche)
+ROAD100_TOWN_BUS <- false; // experiment intra-urbain, uniquement route seule
+ROAD100_ROAD_BATCH <- false; // extension du nombre de lignes ROAD par passe, opt-in
+ROAD100_TOWN_VOIRIE <- false; // reutilisation du planiteur voirie pour bus locaux
+ROAD100_PAX_FLEET_CAP <- 0; // seul ROAD100-4 : 0=plafond historique 2, 8=essai
+ROAD100_TOWN_ROI_POST <- false; // ROAD100-5 : garde PAX locale apres trace reel
+ROAD100_INTERCITY_SITE_FLEET <- false; // ROAD100-6 : demande par arret et flotte interurbaine
+ROAD100_SITE_FIRST <- false; // ROAD100-7 : classer sur sites reellement constructibles, ROAD seul
+ROAD100_JOINED_STOPS <- false; // ROAD100-8 : satellites passagers joints au terminal, ROAD seul
+ROAD100_MULTICATCHMENT <- false; // ROAD100-9 : nouvelle ligne vers quartiers non recouverts, ROAD seul
+ROAD1Y_DIST_BANDS <- true; // ROAD1Y : traces route jusqu'a 128 tuiles, candidats fret par bandes 64-128, 32-63, 7-31
+ROAD1Y_DIST_BAND <- -1; // bande courante pendant une generation (-1 = bornes historiques)
+ROAD1Y_DIST_BAND_LIMITS <- [[64, 128], [32, 63], [7, 31]];
+ROAD1Y_FLEET <- 4; // ROAD1Y : vehicules par paire de quais des la premiere annee (0 = plafond historique ; 4 par defaut sur cette branche)
+ROAD1Y_SPREAD_STOPS <- 0; // Distributed joined PAX stops, 0..4.
+ROAD1Y_EXTRA_STOPS <- 2; // Quais joints supplementaires, opt-in 0..3.
+ROAD1Y_FLEET_UNLOCK <- 0; // ROAD1Y-E : masque deverrouillage flotte bus (1=arret 5k, 2=refleet 10k, 4=pax refleet+suivi quais, 8=cap 6/arret)
+ROAD1Y_LONG_V3 <- 0; // ROAD1Y-G : trace 192 tuiles, bandes fret inchangees (0 = off, trace 128)
+ROAD1Y_ASTAR <- 0; // ROAD1Y-K : A* routier des paires bus site-first, milliers de noeuds (0 = off)
+ROAD1Y_GAP <- 0; // ROAD1Y : plafond de fourgons MAIL par ligne fille (0 = plafond historique 2)
+ROAD1Y_PAX_SITES <- true; // ROAD1Y-B : scan natif des sites de bus (modele aeroport)
+ROAD_BUS_SITE_CACHE <- {}; // ROAD1Y-B : cache des sites de bus par ville (town.id)
+ROAD1Y_PAX_ECONOMY <- false; // ROAD1Y-C : dimensionnement de flotte bus selon demande et rotation
+ROAD1Y_PAX_REFLEET <- false; // ROAD1Y-D : renfort refleet bus selon passagers en attente aux deux bouts
+ROAD1Y_MAIL_ON_PAX <- false; // ROAD1Y : ligne MAIL fille sur paire de villes bus PAX rentable
+ROAD1Y_WEAK <- 0; // ROAD1Y : realloue les bus des lignes PAX faibles (< seuil x100 GBP/bus) vers les lignes saturees (0=off)
+ROAD1Y_NEXT <- 0; // ROAD1Y : distance Manhattan minimale d'une nouvelle paire bus PAX (0 = off)
+ROAD1Y_MAIL2 <- 0; // ROAD1Y : reserve de caisse MAIL fille en milliers de GBP (0 = reserve historique 25000)
+ROAD1Y_MAIL2_YEARS <- 0; // ROAD1Y : duree d'application de road1y_mail2 en annees (0 = toute la partie)
+ROAD1Y_NEXT3 <- 0; // ROAD1Y : tuiles de voirie non facturees sur une paire PAX 96-127 (0 = capital historique)
+ROAD1Y_PAX_MIN <- 0; // ROAD1Y : poids (%) de la demande equilibree 2*min(A,B) des paires bus-quartier (0 = somme historique)
+ROAD1Y_FREIGHT <- 0; // ROAD1Y : plafond de flotte camions fret routier (0 = plafond historique 2)
+ROAD1Y_TRUCK_FLEET <- 0; // ROAD1Y : flotte des camions fret geree comme AAAHogEx (plafond temps de trajet, ajout/retrait sur l'attente source), 0 = historique
+ROAD100_WAIT_FLEET <- false; // ROAD100-10 : renfort des bus rentables sur attente mesuree
+ROAD100_SITE_WINDOW <- false; // ROAD100-11 : diversifier les preplans physiques a budget fixe
+ROAD100_SITE_NEAR <- false; // ROAD100-12 : trier les couples site-first par distance faisable
+ROAD100_DETOUR <- false; // ROAD100-13 : deux coudes constructibles quand BFS/L echouent
+ROAD100_TOUR <- false; // ROAD100-14 : 3 StationID/4 ordres sur ligne PAX existante
+ROAD100_LONG_INTERCITY <- false; // ROAD100-16 : preflight shadow grands corridors PAX (aucune construction)
+ROAD100_LONG_BUILD <- false; // ROAD100-16 v6 : vrai plan LONG, opt-in distinct du diagnostic shadow
+ROAD100_SEGMENTED_CORRIDOR <- false; // ROAD100-32 : micro-gaps physiques bornes, LONG ROAD-only
+ROAD100_SPARSE_CORRIDOR <- false; // ROAD100-33 : chainage creux lineaire, LONG ROAD-only opt-in
+ROAD100_LONG_MARKET_PROBE <- false; // ROAD100-34 : PASS/mois des racines avant trace, SHADOW ROAD-only
+ROAD100_PORTAL_STITCH <- false; // ROAD100-35 : scanner urbain proche + portails routiers LONG, opt-in ROAD-only
+ROAD100_PAX_GRAPH_BRIDGE <- false; // ROAD100-36 : vrai corridor d43..170 sur voirie + raccords courts, opt-in ROAD-only
+ROAD100_PAX_PORTFOLIO <- false; // ROAD100-20 : pre-capture multi-quartiers et quais joints physiquement verifies, ROAD seul
+ROAD100_FREIGHT_DIVERSITY <- false; // ROAD100-21 : examiner deux cargos fret supplementaires dans une passe ROUTE, opt-in
+ROAD100_FREIGHT_CARGO_ORIGIN <- false; // ROAD100-22 : separer physiquement les origines par cargo fret, opt-in
+ROAD100_BATCH_ROI_15 <- false; // ROAD100-23 : second chantier ROI >=15% au lieu de 25%, garde cash inchangee
+ROAD100_PAX_LIVE_FILTER <- false; // ROAD100-25 : retirer les projets PAX perimes avant reselection, opt-in
+ROAD100_PAX_BERTH_BALANCE <- false; // ROAD100-26 : vrai quai bus du cote limitant, sans captation anticipee
+ROAD100_PAX_DOUBLE_BERTHS <- false; // ROAD100-28 : deux quais bus physiques en deux annees pour lignes pax 1/1
+ROAD100_MAIL_INTERTOWN <- false; // ROAD100-27 : lignes MAIL ville->ville sur sites camion physiques, option
+ROAD100_MAIL_LONG_EXISTING <- false; // ROAD100-27b : uniquement longue voirie deja connectee, mode2
+ROAD100_PAX_INTERCITY_ROOTS <- false; // ROAD100-29 : sonde passive villes PAX distance 43..80, aucun projet
+ROAD100_PAX_PRODUCER_UNITS <- false; // ROAD100-30a : producer counts -> town-share PAX/month only on site-first
+ROAD100_PAX_INITIAL_BERTH_FLEET <- false; // ROAD100-31 : initial extra PAX buses only after bilateral real joined berths
+ROAD100_PAX_ROOTS_LAST_YEAR <- -1; // sonde transitoire : au plus une exposition par annee et par processus
+ROAD100_LONG_SHADOW_YEAR <- -1; // ROAD100-16 : une prequalification longue par annee, jamais par regeneration PO01C
+/* EB-14 : vivier AIR/RAIL en tranches avec publication intermediaire ; OFF par defaut. */
+EB14_PROGRESSIVE <- false;
+/* Ablation EB-14 : garder C121 toute la premiere annee avec ROUTE ; OFF. */
+EB14_AIR_ROAD_YEAR_GUARD <- false;
+/* EB-3: pre-remplir le vivier RAIL en annee initiale, sans avancer les achats RAIL. */
+EB3_RAIL_FIRST_YEAR_PREFETCH <- false;
+EB14_INITIAL_RAIL_JOB <- false; // transitoire : le prochain Load repart d'une demande neuve.
+/* Trace EB14 strictement experimentale (EB14 + probes=258). Jamais sauvegardee. */
+EB14_TRACE_SIGN_COUNT <- 0;
+EB14_TRACE_SIGN_TYPES <- { E4 = 0, E5 = 0, E6 = 0 };
+EB14_TRACE_SELECTED <- {};
+/* INVEST-STALL : recharge additionnelle du vivier rail apres 1973, strict opt-in. */
+INVEST_STALL <- false;
+/* RAIL-LOOP : voie 2 de retour par l'arriere des quais, boucle a sens unique, strict opt-in. */
+RAIL_LOOP <- false;
+/* RAIL-FILL retire le 20/11 : subsume par RAIL-GROW (rail_fill.nut garde le code partage). */
+/* RAIL-GROW : la capacite d'une ligne fret saturee vient d'abord de sa propre rame, strict opt-in. */
+RAIL_GROW <- false;              // rail_grow, defaut 1 depuis le 17/11, lu par settings.nut
+RAIL_GROW_FIRST <- false;        // rail_grow=2 : ni ligne soeur ni boucle tant que la rame peut grandir
+INVEST_STALL_LAST_MONTH <- -1;
+INVEST_STALL_SAVED_MONTH <- -1;
+/* V207 : part de captage des passagers urbains par le rail (0 = historique 22 %). */
+V207_RAIL_PAX_SHARE_PCT <- 0;
+/* V207 : second cargo courrier sur les rames passagers rail. */
+V207_RAIL_MAIL <- false;
+/* V207 : nombre maximal d'arrets de bus traversants joints a chaque gare rail passagers. */
+V207_RAIL_PAX_JOINED_STOPS <- 0;
+/* V207 : sites de gare passagers classes par production captee (0 = premiers sites trouves). */
+V207_RAIL_PAX_SITE_RANK_PCT <- 0;
+/* V275 : masque rail voyageurs en multimodal (voir info.nut). */
+V275_RAIL_PAX_MM <- 15;
+/* V214 : couts de virage du A* rail a la AAAHogEx (pathfinder.nut, InitializeParameters/__Cost).
+ * Defaut 300/1500 adopte sur decision utilisateur le 16/10 apres B 20x10 positif,
+ * avec portes A 40x3 et 40x5 non qualifiees. 0 = historique (50 a chaque changement de direction,
+ * aucun surcout de coude serre).
+ * V214_RAIL_TURN_COST > 0 : entrer dans une diagonale est gratuit, en sortir coute ce montant.
+ * V214_RAIL_TIGHT_TURN_COST > 0 : coude de 90 degres pris sur une seule tuile (droite, coin,
+ * droite perpendiculaire), 88 km/h en acceleration realiste ; ramene a 100 sous 40 tuiles. */
+V214_RAIL_TURN_COST <- 300;
+V214_RAIL_TIGHT_TURN_COST <- 1500;
+V307_LONG_PROBE <- 0;  // V307 : sonde de mesure des longs traces, bloquante, defaut 0
+V307_PROBE_YEAR <- 0;
+V307_DONE <- false;
+V308_CARTO_PROBE <- 0;  // V308 : mesure passive de cinq motifs sur des blocs 8x8
+V308_DONE <- false;
+V307_ABND_AUTOPSY <- false;
+V307_SITES <- 0;  // V307 1.8 : sites rail repartis par octant, defaut 0
+V307S3_REACH <- {};  // V307S=3 : cache de portee requis par builder_rail, non persiste.
+function OpexV207Active()
+{
+  return V207_RAIL_MAIL || V207_RAIL_PAX_SHARE_PCT > 0 || V207_RAIL_PAX_JOINED_STOPS > 0;
+}
+/* RAIL-SIDINGS P0: inventaire geometrique strictement en lecture seule ; OFF au defaut. */
+RAIL_SIDINGS_SHADOW <- false;
+RAIL_DOUBLE_OFF <- false;         // rail_double_offer=1 : pas de recherche DOUBLE depuis les evitements
+RAIL_STALE_ABANDON <- false;      // rail_stale_abandon=1 : echec STALE -> delai de reprise
+RS_TRIGGER_GROWTH <- false;      // rail_sidings_trigger=2 : derive de production smooth incluse
+RS_ECONOMIC_TRIGGER <- false;    // rail_sidings_trigger=1 : seconde rame decidee par la marge, pas par le stock
+RAIL_ENGINE_VALUE <- 0;          // rail_engine_value, defaut 5 depuis le 17/11, lu par settings.nut (catalog.nut OpexRailLocoBetter)
+RAIL_CONSIST_HEADROOM_PCT <- 0;  // rail_consist_headroom_pct, defaut 100 depuis le 17/11, lu par settings.nut (economy.nut)
+/* P1 : fenetre de fret long, exclusivement sur C121/C80 ; 0 OFF historique. */
+P1_RAIL_LONG_VALUE_RANK <- 0;
+/* V294c : depart glouton a 400 %, repli par segment (porte B 20x10 passee, +58,4 k ;
+ * defaut du 21/10, fige le 18/11). */
+const V294C_RAIL_WEIGHT_ADAPT = 400;
+V216_PROBE <- false;
+V211_RIVALS <- false;
+V211_LAST_QUARTER <- -1;
+/* V262 T10/T15 : annee et date du dernier releve orphelins. Non persistes
+ * (un rechargement un 1er decembre peut journaliser une seconde fois).
+ * Aucune decision ne lit ces valeurs. */
+V262_ORPHAN_YEAR <- -1;
+V262_ORPHAN_DATE <- -1;
+/* FRONT-PAX-2 : 0 historique, 1 shortlist shadow pure, 2 pilote AIR PASS borne. */
+FRONT_PAX2_BOUNDED_OVERLAP <- 0;
+/* P2 : fret rail physiquement pret, echange adjacent sur le seul top-K finance. */
+P2_RAIL_CARGO_OPPORTUNITY_RANK <- 0;
+/* Provenance P2 transitoire : invalide les annotations d'une election precedente. */
+P2_OPPORTUNITY_STAMP <- 0;
+/* Vrai si une passe projets s'est arretee faute de caisse depuis le dernier
+ * passage statue. Vrai au depart : le premier mois ne compte pas. Pas sauvegarde. */
+V249_CASH_STOP <- true;
+/* Vrai si une passe projets s'est arretee faute de caisse depuis le dernier
+ * passage de rafraichissement aerien. Vrai au depart. Pas sauvegarde. */
+V252_CASH_STOP <- true;
+/* V250 : 0 inerte, 1 droits en ville disputee, 2 test de creneau aeroport,
+ * 3 test elargi a toutes les villes ou un rival a un aeroport. */
+V250_RIGHTS <- 0;
+/* Meme signal que V249, mais reserve au mode 1. Le mode 2 ne le lit pas.
+ * Vrai au depart : le premier mois de mode 1 ne compte pas. Pas sauvegarde. */
+V250_CASH_STOP <- true;
+/* V259 : renouvellement des ponts plus rapides (task_v259.nut). */
+V259_BRIDGE_RENEW <- 0;
+/* V277 : publication rapide des projets air et filtre indexe de re-selection. */
+V277_AIR_PUB_FAST <- 0;
+/* V294c : poids heuristique A* rail unifie a toutes les distances, AAA : 200 partout (fige le 18/11). */
+const V294_RAIL_WEIGHT_PCT = 200;
+/* V294f : sonde A* inverse existante, valeur par defaut adoptee figee a 300 iterations. */
+V294_RAIL_REVERSE_PROBE <- 300;
+/* V294i : distance railMax des candidats decouplee du plafond d'iterations (fige a 200 le 18/11). */
+const V294_RAIL_DIST_DECOUPLE = 200;
+/* Cascade pax par distance decroissante : air seul, air+rail, rail seul,
+ * route seule. Le fret accompagne la premiere passe. */
+STAGED_BOOTSTRAP <- true;
+/* D4 : Dwell time de chargement/dechargement a la station pour les bus passagers (jours) */
+const ROAD_PAX_STOP_DWELL_DAYS = 6;
+/* D4, extension aerienne : le diagnostic 10 ans x 5 graines
+ * (results/diag_road_purpose.json) donne revenu reel/predit median = 1,0427 pour
+ * air|pax. Le modele etait donc legerement conservateur. Ce facteur ne touche
+ * que le revenu passager aerien, avant le calcul du profit et des scores. */
+AIR_PAX_REVENUE_CALIBRATION_PCT <- 104;
+/* C27 : Sortir les bonus du numerateur de densite du portefeuille (adopte) */
+/* Panneaux de diagnostic : lu UNE fois depuis le reglage dans Start(), pas a chaque appel (57
+ * panneaux par an, GetSetting a chaque fois serait du gaspillage d'opcodes pour une valeur qui ne
+ * change jamais en cours de partie). Defaut vrai : voir info.nut::debug_signs -- toute
+ * l'instrumentation de sweeps/*.py passe par ces panneaux, AILog.Info n'etant pas capture par
+ * OpenTTDLab. On ne les coupe que pour une partie avec des humains. */
+DEBUG_SIGNS <- true;
+/* V167 : masque du reglage `probes` apres expansion du bit 1 (voir settings.nut). */
+OPEX_PROBE_MASK <- 2;
+FAIR_PLAY_COURTESY <- false; // Mode courtoisie pour parties normales/humaines (defaut OFF).
+IDLE1_SLACK_RESERVE <- 2500; // Marge de securite anti-franchissement de tick.
+IDLE1_TOWN_CURSOR <- 0;
+PO02_INDEPENDENT_EXPIRY <- 3; // PO-02 : report des viviers frais, defaut 3 depuis le 22/11 (portes A +63 k p=0,037, B pass).
+PO02_LAST_PUBLISH_DATE <- { air = 0, rail = 0, road = 0, water = 0, fleet = 0 };
+PO02_DEFER_SINCE <- { road = 0, water = 0, fleet = 0 };
+PO02_MIN_FRESH <- { road = 30, water = 90, fleet = 30 };
+const PO02_MAX_DEFER = 90;
+PO02_RETRY <- null; // Transient all-deferred snapshot; never saved.
+EB7_LEDGER <- { capexRoad = 0, capexAir = 0, vehBuyAir = 0, lastCash = 0, lastLoan = 0 };
+/* AUTO150 16777216: tick-granularity, read-only head/branch trace.
+ * Never runs with the ordinary probes=258 or rail_sidings=0 defaults. */
+RS_TRAFFIC_TRACE <- false;
+/* Mesure ponctuelle : un panneau par ligne reussie, donc desactivee par defaut pour ne pas
+ * changer le profil d'opcodes de la baseline. */
+RAIL_COST_PROBE <- false;
+/* Symetrique aerien de RAIL_COST_PROBE : un panneau AC| par tentative, reussie ou non. C'est le
+ * seul moyen de chiffrer le nivellement et les aeroports batis puis rases (S0 unvicies). */
+AIR_COST_PROBE <- false;
+/* Symetrique route de RAIL_COST_PROBE/AIR_COST_PROBE, jamais construit avant (docs/taches.md,
+ * retrouve le 2026-09-08). Panneau RP| par tentative, reussie ou non (RC| deja pris). */
+ROAD_COST_PROBE <- false;
+/* C33.2 : Arrets de rabattement joints dans le chantier aeroport */
+/* B9/G4 : sonde passive post-chantier du catchment AIR. Defaut 0 : aucune tuile
+ * supplementaire n'est inspectee dans le comportement livre. */
+AIR_CATCHMENT_PROBE <- false;
+/* M3/G12 : sonde passive du choix de materiel avant ROI. Elle n'est jamais lue par les
+ * regles de selection ; elle autorise uniquement les comparatifs et logs de diagnostic. */
+EQUIPMENT_ROI_PROBE <- false;
+/* Nombre maximal d'arrets bus annexes partageant directement le StationID de l'aeroport. */
+AIR_JOINED_STOP_LIMIT <- 2;
+/* Early-slot: prioritise profitable air projects that claim a first
+ * airport in large towns before competitors can consume both town slots. */
+AIR_EARLY_SLOT_TARGET_TOWNS <- 6;
+AIR_EARLY_SLOT_MIN_POP <- 1000;
+AIR_EARLY_SLOT_BONUS_PCT <- 50;
+/* C83.1 : objectif territorial distinct du bonus early-slot historique.
+ * L'ablation du 2026-09-24 a teste 24 villes, mais les 18 villes marginales
+ * ajoutaient des courses moins propres et degradaient la valeur au 5x6 ;
+ * conserver le coeur des 6 plus grandes villes tant qu'un elargissement n'est
+ * pas requalifie. */
+AIR_C83_TARGET_TOWNS <- 6;
+/* Refaire le sac a dos contre la caisse vivante, sans repayer la generation des candidats. */
+/* C36.1 : Caching incremental du vivier post-chantier. */
+/* Compatibilite de cadence VM apres suppression des flags economy morts. Constante interne, jamais configurable ni vraie. */
+/* C39.0 : sonde passive du bus d'invalidation. A 1, les evenements marquent les
+ * dependances qui SERAIENT rafraichies et journalisent la passe mensuelle actuelle ;
+ * ils ne changent ni sa cadence, ni les candidats, ni les decisions. */
+C39_INVALIDATION_PROBE <- false;
+/* C39.3 : sonde de l'effet reel d'une invalidation sur le catalogue et le premier projet. */
+C39_DECISION_DELTA_PROBE <- false;
+/* C39.4 : explique pourquoi un EngineAvailable air n'est pas retenu par les combos. */
+C39_AIR_REASON_PROBE <- false;
+/* C41.0 : registre passif revision/acquittement pour les futures micro-taches ciblees. */
+C41_REVISION_PROBE <- false;
+/* Compatibilite d'opcodes des anciens flags WATER tous forces false. Ce slot ne pilote
+ * aucune fonctionnalite et ne possede aucun reglage utilisateur. */
+/* C41.11 : ledger passif du scheduler. Il n'admet ni ne reporte aucune tache. */
+C41_SLACK_LEDGER <- false;
+/* C41 : attribution mensuelle du temps du controleur, uniquement pour diagnostic. */
+C41_MONTHLY_BUSY_LEDGER <- false;
+/* C41.12 : age de fraicheur par couche entre premier salissement coalesce et acquittement. */
+C41_STALENESS_LEDGER <- false;
+/* C41.13 : croise passivement les couches encore sales avec le reliquat d'opcodes du scheduler.
+ * Il ne choisit ni ne reporte aucune tache : il borne d'abord le canal de delestage possible. */
+C41_OPPORTUNITY_LEDGER <- false;
+/* C41.14 : contrat passif d'admission d'une micro-tache. Le seul pilote declare est le petit
+ * refresh water ; ajouter route/rail/air exige d'abord leur point d'entree cible et son cout. */
+C41_ADMISSION_LEDGER <- false;
+/* V95 item 1 : tours de file selectionnes vs no-op, strictement observatoire.
+ * Meme gate que les ledgers C41/C39 : probes bit 10 ou groupe 8, defaut 0. Aucune admission. */
+V95_SCHED_IDLE_LEDGER <- false;
+/* C41.16 : ventilation passive de la generation de candidats route historique. */
+C41_ROAD_CANDIDATE_PROFILE <- false;
+/* C41.17 : sous-ventilation passive du fret producteur->accepteur. */
+C41_ROAD_FREIGHT_PROFILE <- false;
+/* C41.18 : index spatial local des origines fret route deja desservies. */
+/* C41.19 : profil passif interne des puits urbains du fret route. */
+C41_ROAD_FREIGHT_TOWN_PROFILE <- false;
+/* C41.20 : index experimental des puits urbains acceptant le cargo fret. */
+/* C41.22 : cout et debit du pipeline rail vers le portefeuille, sans preemption. */
+C41_RAIL_PORTFOLIO_PROFILE <- false;
+/* C41.23 : ventilation passive de la generation rail pax/fret/classement. */
+C41_RAIL_CANDIDATE_PROFILE <- false;
+/* C41.24 : sous-ventilation passive des paires passagers rail. */
+C41_RAIL_PAX_PROFILE <- false;
+/* C41.25 : sous-ventilation passive du helper de candidature pax rail. */
+C41_RAIL_PAX_CANDIDATE_PROFILE <- false;
+/* C41.26 : sous-ventilation passive de l'economie pax rail. */
+C41_RAIL_PAX_ECONOMICS_PROFILE <- false;
+/* C41.27 : detail passif vitesse effective dans l'economie pax rail. */
+C41_RAIL_PAX_SPEED_PROFILE <- false;
+/* C41.28 : detail et reutilisation exacte des calculs de vitesse pax rail. */
+C41_RAIL_PAX_SPEED_DETAIL_PROFILE <- false;
+/* C41.29 : reutilisation exacte de la vitesse de croisiere pax rail. */
+C41_RAIL_PAX_CRUISE_PROFILE <- false;
+/* C41.30 : cache de croisiere pax, limite a une generation de candidats rail. */
+/* C41.31 : ventilation passive du fret rail. */
+C41_RAIL_FREIGHT_PROFILE <- false;
+/* C41.32 : cout des candidats dans les deux branches fret rail. */
+C41_RAIL_FREIGHT_CANDIDATE_PROFILE <- false;
+C41_RAIL_FREIGHT_ECONOMICS_PROFILE <- false;
+C41_RAIL_FREIGHT_ECONOMICS_DETAIL_PROFILE <- false;
+C41_RAIL_FREIGHT_ECONOMICS_SETUP_PROFILE <- false;
+C41_RAIL_FREIGHT_ECONOMICS_CONSIST_PROFILE <- false;
+/* C41.37/C41.38 : reutilisation exacte puis cache de croisiere fret, local a une generation. */
+C41_RAIL_FREIGHT_CRUISE_PROFILE <- false;
+C41_RAIL_FREIGHT_SPEED_DETAIL_PROFILE <- false;
+C41_RAIL_FREIGHT_EFFECTIVE_SPEED_PROFILE <- false;
+C41_RAIL_FREIGHT_TOWN_GUARDS_PROFILE <- false;
+/* C41.4 : sonde strictement passive des vehicules perdus. Contrairement a A7.4,
+ * elle n'ecrit ni compteur de ligne ni signe, et n'arme aucune tache. */
+C41_VEHICLE_LOST_PROBE <- false;
+/* C41.5 : detail rail de C41.4 ; aucune reparation, seulement l'etat observable au Lost. */
+C41_RAIL_LOST_PROBE <- false;
+/* C54 : inventaire annuel des vehicules via API, strictement inerte hors reglage dedie. */
+C54_VEHICLE_ORDERS_PROBE <- false;
+/* C41.6 : correlation de topologie persistee des memes Lost rail, sans action. */
+C41_RAIL_LOST_TOPOLOGY_PROBE <- false;
+/* C41.7 : lecture locale des approches/depots d'une ligne double en Lost, sans route ni mutation. */
+C41_RAIL_LOST_PHYSICAL_PROBE <- false;
+/* C41.8 : reparation experimentale, idempotente et limitee aux approches simples d'une ligne
+ * double ayant reellement emis VehicleLost. */
+C41_RAIL_LOST_SIGNAL_REPAIR <- false;
+/* C41.9 : sonde locale de connectivite, sans recherche de chemin ni commande. */
+C41_RAIL_LOST_CONNECTIVITY_PROBE <- false;
+/* C41.10 : reparation transactionnelle du seul raccord manque identifie par C41.9 (une branche
+ * candidate non ambigue) -- AITestMode d'abord, commande reelle seulement si le meme raccord
+ * reussit en test. */
+C41_RAIL_LOST_JUNCTION_REPAIR <- false;
+/* C41.46 : separe les opcodes nets d'une tranche _continueRailSearch() de ceux de la tache de
+ * file executee dans la MEME passe de _runNextTask (main.nut A4) -- le ledger C41.11 agrege les
+ * deux des que _railSearch est non nul en entree de passe. Purement observatoire. */
+C41_RAIL_SLICE_LEDGER <- false;
+/* C41.47 : pendant de la garde G3S1 (plan en echec) applique au blocage tresorerie --
+ * _consumeRailSearch() libere _railSearch des le premier blocage cash au lieu de le garder
+ * indefiniment, ce qui debloque _expandRailLines et les AUTRES candidats rail du portefeuille.
+ * candidate.railPlan est conserve. Correctif de blocage, pas un arbitrage.
+ * ADOPTE au banc officiel 20x10 (2026-09-09) : voir info.nut pour les chiffres. */
+/* C41.48 : sonde passive a chaque frontiere de tranche segmentee (CONT/done=false). Rien n'est
+ * coupe ; mesure si un test de domination (C41.49) aurait meme l'occasion de se declencher. */
+C41_RAIL_DOMINATION_PROBE <- false;
+/* C41.49 (reformule 2026-09-10, docs/04_arbitrage_rail_search.md) : sonde passive dans
+ * _tryBuildProjects, active seulement pendant une recherche rail (kind=="primary",
+ * phase=="search", meme garde que C41.48). Ne coupe rien : mesure si le fallthrough du
+ * portefeuille (un candidat rail rejete search_in_progress n'interrompt pas la boucle) essaie et
+ * construit deja les alternatives non-rail que C41.48 voit financables a la frontiere -- avant
+ * d'ecrire une regle de decision, savoir si elle a deja lieu par defaut. */
+C41_PROJECTS_FALLTHROUGH_PROBE <- false;
+/* C39.5 : sonde passive de cadence de la tache projects. Le repli 0 ne doit ajouter ni appel
+ * d'API ni calcul au chemin livre ; voir docs/05_cadence_projects_rail_search.md. */
+C39_PROJECTS_CADENCE_PROBE <- false;
+/* C39.6 (docs/05_cadence_projects_rail_search.md S4.3) : mesure le delta date/tick/opcodes d'une
+ * passe de _runNextTask, decompose entre la seule tranche A* et la tache de file jouee dans la
+ * MEME passe, ventile par nom de tache et par presence de tranche. Reglage NOUVEAU et
+ * INDEPENDANT de C41_RAIL_SLICE_LEDGER : ne pas etendre ce dernier, sa mesure est deja publiee.
+ * Le repli 0 ne doit ajouter ni appel d'API ni calcul au chemin livre. */
+C39_PASS_CLOCK_LEDGER <- false;
+/* C49 etape 1 : sonde strictement observatoire de la cause prochaine du projet non bati.
+ * Le repli 0 ne doit atteindre ni lecture de tresorerie finale, ni plafond de vehicules, ni
+ * allocation de ledger. */
+C49_SCARCITY_LEDGER <- false;
+/* C55 etape 1 : mesure seule du filtre OR route. Le ledger est nul hors sonde. */
+C55_ORIGIN_RELAX_PROBE <- false;
+C55_ORIGIN_RELAX_LEDGER <- null;
+/* C55 : sonde de tracabilite des revalidations PAX routieres bloquees par une origine deja servie. */
+C55_PAX_TRACE_PROBE <- false;
+C55_PAX_TRACE_LEDGER <- null;
+/* C60 : Sonde d'exposition aux notes municipales. */
+C60_TOWN_RATING_PROBE <- false;
+C60_TOWN_RATING_LEDGER <- null;
+/* C56 : trace immediate du dispatch, nulle hors sonde. */
+C56_TASK_TRACE <- false;
+C56_LOOP_TICK_COUNT <- 0;
+/* C56 : cumul des tranches du travailleur actif (trace seulement). */
+C56_WORKER_ACC <- null;
+/* C50 : Sonde chronologique legere (tresorerie, profit par ligne, projets batis et refuses). */
+C50_CHRONOLOGY_PROBE <- false;
+/* C63+C58 : ledger annuel depenses / recettes / occasions. Nul hors sonde. */
+C63_INVEST_PROBE <- false;
+C63_INVEST_LEDGER <- null;
+/* C70 : facteur realise/predit par mode, recalcule au rapport annuel et au rechargement. */
+C70_MODE_FACTOR <- { rail = 1.0, road = 1.0, air = 1.0, water = 1.0 };
+/* ESTIM-1 (estim_unifie, bits par lot, defaut 0). Bit 1 : facteur de realisation de la RECETTE
+ * par mode, applique avant frais et amortissement. A priori = recette realisee / recette brute
+ * predite, annees pleines a flotte de construction, DUEL 40x10 du 21/10
+ * (sweeps/estim_unifie_priors.py ; AIR = moyenne C121 des trois bras) ; WATER sans mesure.
+ * Poids de l'a priori en annees-lignes : Bayes empirique AIR 9, RAIL 36, ROUTE 1 ; une valeur. */
+ESTIM_UNIFIE <- 0;
+ESTIM_K_R_PRIOR <- { rail = 1.00, road = 0.57, air = 1.50, water = 1.0 };
+ESTIM_K_R_PRIOR_WEIGHT <- 15.0;
+ESTIM_K_R <- { rail = 1.00, road = 0.57, air = 1.50, water = 1.0 };
+/* ESTIM-1 bit 16 : profil RAIL fige par distance, recentre sur le prior global
+ * rail 0.92. L'apprentissage en jeu conserve un seul facteur de niveau. */
+ESTIM_RAIL_KR_PROFILE_A <- 0.5722990662;
+ESTIM_RAIL_KR_PROFILE_B <- 0.00258519378;
+ESTIM_RAIL_KC_A <- 1.0778667894;
+ESTIM_RAIL_KC_B <- 0.00324189259;
+ESTIM16_RAIL_SCORE_TRACES <- 0;
+/* C69 etape 1 : sonde passive goulot de decision P / max(C, F*tau). */
+/* Annee de depart de la compagnie (sauvegardee via _startYear) : base des calculs C69/C75 de F et
+ * de tau. 1970 n'est qu'un repli, pose avant Start(). */
+OPEX_START_YEAR <- 1970;
+C69_BOTTLENECK_PROBE <- false;
+/* C69 : le levier permanent exige le suivi des dates de chantier pour tau. */
+C69_BUILD_DATES <- null;
+C69_PENDING_FOLLOWUPS <- null;
+C69_BUILD_PASS_COUNT <- 0;
+C69_LAST_AFFORDABLE <- null;
+C69_LAST_KDEC_DATA <- null;
+/* C72 : sonde passive du choix d'avion (C69 etape 1) */
+C69_CACHED_KDEC_DATE <- -1;
+C69_CACHED_KDEC_VALUE <- 0;
+C69_PLANE_CHOICE_CALLS <- 0;
+C69_PLANE_CHOICE_DIFFER_ROI <- 0;
+C69_PLANE_CHOICE_DIFFER_C69 <- 0;
+/* C73 : sonde passive du vivier avant selection et des passes du portefeuille */
+C73_VIVIER_LEDGER <- null;
+/* V93 fige : pas de plancher a 600 habitants pour poser un aeroport.
+ * Le plancher minimal n'est pas un reglage : il evite seulement les hameaux. */
+V93_AIRPORT_MIN_POP <- 100;
+V278_AIR_LAZY_SITES <- false;
+V278_AIR_VALIDITY <- null;
+V278_AIR_EPOCH <- 0;
+C96_AIR_SITE_MAX_VALID <- 4;
+C96_AIR_SITE_EXTRA_RINGS <- 1;
+/* air_site_funnel : 0 = spirale actuelle, 1 = meme spirale, predicat
+ * d'emprise natif. Defaut 1 depuis le 27/10 (decision utilisateur).
+ * AIR_SITE_SEARCH_* cumule les opcodes de chaque OpexAirFindSite, scan
+ * finalise ou non. Telemetrie, hors Save. */
+AIR_SITE_FUNNEL <- 1;
+AIR_SITE_RANKED <- 0; // Native score-ranked funnel; info.nut default 1 (loaded at Start).
+AIR_SITE_OPS_MARK <- null;
+AIR_SITE_SEARCH_OPS <- 0;
+AIR_SITE_SEARCH_CALLS <- 0;
+C117_AIR_SAMPLE_DAYS <- 2;
+AIR_LOAD_MIN_PCT <- 0;
+C117_AIR_LAST_DATE <- -1;
+C117_AIR_LINE_STATE <- {};
+C117_AIR_VEHICLE_STATE <- {};
+/* P3 : trois fenetres C117 transitoires par ligne, sans Save/Load ni lecture en OFF. */
+P3_AIR_FLEET_YIELD <- 0;
+P3_AIR_FLEET_WINDOWS <- {};
+/* Etat transitoire " avion de la partie " par type d'aeroport. Non
+ * sauvegarde : apres chargement, l'etat se reconstruit tout seul.
+ * Une cle de mode (capital, profit par vehicule) pourra s'y ajouter plus tard. */
+C121_GAME_ENGINE_STATE <- {};
+C121_AIR_PROJECT_REALIZATION_ADAPTIVE <- false;
+C121_AIR_PROJECT_REALIZATION_MIN_CONTESTABLE_PERMILLE <- 650;
+C121_AIR_PROJECT_REALIZATION_MAX_OPEN_PERMILLE <- 200;
+C121_AIR_PROJECT_REALIZATION_MIN_PRESSURED <- 3;
+C121_AIR_PROJECT_REALIZATION_CLASSIFY_YEARS <- 2;
+C121_AIR_PROJECT_REALIZATION_YEARS_OBSERVED <- 0;
+/* -1 = observation/non classe, 0 = race, 1 = efficiency. Une fois classe,
+ * le regime reste stable pour eviter qu'une politique modifie son propre
+ * signal de classification. */
+C121_AIR_PROJECT_REALIZATION_REGIME <- -1;
+C121_AIR_PRESSURE_ACCUM <- null;
+C121_AIR_PRESSURE_PREV <- null;
+C122_AIR_REGIME_SHADOW <- false;
+/* C122.4 : sonde locale de menace territoriale. Elle ne cree aucune politique :
+ * elle relie seulement une transition C83 remaining=1 a un projet AIR deja
+ * vivant/finance, puis suit le meme TownID jusqu'a claimed/lost. */
+C122_AIR_THREAT_PROBE <- false;
+C122_AIR_THREAT_WATCH <- {};
+C122_AIR_THREAT_SEQ <- 0;
+C121_AIR_ENGINE_CAPACITY_OBS <- {};
+/* C121 : calibration recente du revenu des NOUVELLES lignes, par bras. Le
+ * cold-start reste 1.0. Le rapport annuel remplace ensuite cette valeur par une
+ * moyenne recente realise/brut, lisible en O(1) pendant le scoring. */
+C121_AIR_REALIZATION_FACTOR <- { newpair = 1.0, hubsite = 1.0, hubhub = 1.0 };
+C121_AIR_REALIZATION_MIN_LINES <- 2;
+/* Cache transitoire reconstruit au rapport annuel et apres Load. */
+AIR_P0_DIRECT_REALIZATION_ACTIVE <- false;
+C121_AIR_P0_DIRECT_FACTOR <- { hubsite = 1.0, hubhub = 1.0 };
+/* Diagnostic agrege de cout du chemin causal C121 pendant une passe AIR.
+ * La table est recreee a chaque planification (ou conservee dans resumeState
+ * pour une passe slicee) et ne participe a aucune decision. */
+C121_AIR_PLAN_PERF <- null;
+/* Sondage opcodes boucle (probes bit 11 ou groupe 8) : agregats annuels. */
+PROBE_LOOP_OPS <- false;
+/* Intervalles dates des micro-taches (probes bit 12 ou groupe 8). Defaut 0. */
+PROBE_SPAN_TRACE <- false;
+/* F-EVENT-BACKLOG-01 : sonde passive de la file d'evenements. Defaut 0. */
+PROBE_EVENT_BACKLOG <- false;
+/* Sonde de rejet de selection portefeuille AIR (cash, floor, dedupe, topk). Defaut 0. */
+PROBE_SELECT_REJECT <- false;
+EVENT_BACKLOG_CALLS <- 0;
+EVENT_BACKLOG_EVENTS <- 0;
+EVENT_BACKLOG_MAX_BURST <- 0;
+EVENT_BACKLOG_OPS_TOTAL <- 0;
+EVENT_BACKLOG_OPS_MAX <- 0;
+EVENT_BACKLOG_MONTH <- -1;
+SPAN_STACK <- null;
+SPAN_BY_ID <- null;
+SPAN_NEXT_ID <- 1;
+SPAN_LINES <- 0;
+SPAN_AGG_LINES <- 0;
+SPAN_YEAR <- -1;
+SPAN_ROOT_AGG <- null;
+OPEX_LOOP_PROF <- null;
+OPEX_LOOP_PROF_YEAR <- -1;
+OPEX_LOOP_PROF_TICK0 <- 0;
+/* Contexte actif du diagnostic d'opcodes exacts. */
+OPCODE_EXACT_SITE_NAME <- null;
+CATALOG_COST_ACTIVE <- null;
+C121_AIR_FIRST_LIVE_GROWTH_PHASE_YEARS <- 0;
+C121_AIR_FIRST_LIVE_STATE <- {};
+C121_AIR_FIRST_LIVE_OPS <- 0;
+C121_AIR_FIRST_LIVE_SAMPLES <- 0;
+C121_CATALOG_FIRST_YEAR_ACTIVE <- false;
+/* Derive du monde, volontairement absent de Save(). */
+C121_CATALOG_CACHE <- {};
+C121_CATALOG_AIRPORT_PRICES <- {};
+C121_CATALOG_AIRPORT_REV <- {};
+C121_CATALOG_STATION_REV <- {};
+C121_CATALOG_STATION_LINES <- {};
+C121_CATALOG_HUB_LEARN_REV <- {};
+C121_CATALOG_AIRPORT_LEARN_REV <- {};
+C121_CATALOG_ARM_LEARN_REV <- {};
+C121_CATALOG_TOWN_PRIORITY <- {};
+C121_CATALOG_TOWN_REV <- {};
+C121_CATALOG_TOWN_POP <- {};
+C121_CATALOG_TOWN_PROD <- {};
+C121_CATALOG_TOWN_CURSOR <- 0;
+C121_CATALOG_TOWN_BATCH_DATE <- -1;
+/* Snapshot endpoint C121 limite a une passe de planification AIR. Un meme site
+ * (ancre/type/cargo/etat de reutilisation) est evalue une fois puis reutilise
+ * pour toutes les paires de cette passe. */
+C121_AIR_ENDPOINT_CACHE <- null;
+/* C121 timing adaptatif : chaque station publie une moyenne du residu
+ * operationnel observe sur une fenetre recente d'environ un trimestre.
+ * Le residu reste signe pendant l'accumulation pour ne pas biaiser la
+ * quantification de C117 (echantillonnage tous les 2 jours) ; seule
+ * l'estimation publiee, interpretee comme un delai, est bornee a >= 0. */
+C121_AIR_HUB_DELAY_STATE <- {};
+C121_AIR_HUB_DELAY_WINDOW_DAYS <- 91;
+C121_AIR_HUB_DELAY_MIN_OBS <- 2;
+C121_AIR_HUB_DELAY_UPDATE_OPS <- 0;
+C121_AIR_HUB_DELAY_UPDATE_SAMPLES <- 0;
+/* Cargo passagers retenu pour le catchment de site. -1 tant qu'il n'est pas connu. */
+AIR_DEMAND_PAX_CARGO <- -1;
+/* C75 : plusieurs chantiers par passe en phase riche tant que Capital < K_pass et Capital <= Disponible. */
+/* C75 bis : autorise une seule nouvelle ligne financable a franchir K_pass par passe. Defaut 0. */
+C75_KPASS_BYPASS_LEDGER <- null;
+C75_KPASS_BYPASS_LEDGER_YEAR <- -1;
+/* Opt-in: eviter uniquement le diagnostic C75 bis hors panneaux/journal. */
+C75_BYPASS_LEDGER_SKIP <- false;
+/* Facteur de financement rail applique dans OpexProjectFinanceCapital.
+ * Reglage experimental, defaut historique 170. */
+RAIL_FINANCE_BIAS_PCT <- 100;
+C75_PASS_DATES <- null;
+C75_YEAR_LEDGER <- null;
+/* Opt-in de mesure d'opcodes ; 0 conserve les compteurs historiques. */
+C75_YEAR_LEDGER_SKIP <- false;
+/* C76 : sonde passive de la regeneration du vivier sous C39_INVALIDATION_PROBE */
+C76_PREV_STATE <- null;
+C76_YEAR_LEDGER <- null;
+C76_EVENTS_SINCE_PREV <- null;
+/* C78 : sonde passive de la fenetre entre le premier et le second aeroport adverse d'une ville.
+ * Opex publie son vivier AIR a chaque passage projects ; le harnais shared fournit les build_date AAA. */
+C78_SLOT_INTERCEPT_PROBE <- false;
+C78_SLOT_PASS_COUNTER <- 0;
+
+/* Tunnel mensuel candidats/acceptes/finances/tentes/construits. Defaut 0 : un AILog
+ * par passe projects, sans changer la selection. */
+MONTHLY_FUNNEL <- false;
+C50_REFUSE_CACHE <- {};
+C50_NON_EXPANSION_LEDGER <- null;
+/* C50b : test causal du seuil de backlog avant doublement d'une ligne rail existante. */
+/* air_fleet_probe : _resizeAirFleets n'emet que ses SUCCES (FG|). Quand une ligne aerienne
+ * n'grandit pas, la cause est invisible. FR| donne le premier refus rencontre, une fois par ligne
+ * et par an. */
+AIR_FLEET_PROBE <- false;
+/* AIR-FLOTTE-1 : seule la sonde dediee permet le scan du vivier aux achats AIR. */
+AIR_FLOTTE1_SHADOW <- false;
+AIR_FLOTTE1_KDEC <- -1;
+AIR_FLOTTE1_KDEC_TICK <- -1;
+/* Memoire ephemere de la derniere passe : ne modifie aucune decision. */
+AIR_FLOTTE1_RAIL_PATH <- null;
+/* Sonde de tension : aucun calcul ni journal supplementaire sur le chemin par defaut. */
+TENSION_PROBE <- false;
+/* Garde unique du logger de portefeuille : evite un OR supplementaire dans le chemin chaud. */
+PORTFOLIO_LOG <- false;
+/* C45 : persistance complete de l'etat de decision. Defaut aligne sur info.nut (custom_value = 1),
+ * adopte au banc officiel 20x10 apparie -- les vingt graines identiques au bit pres. */
+SAVE_FULL_STATE <- true;
+/* C34.1 : construction aerienne arbitree par le portefeuille seul (1) au lieu de la tache dediee. */
+/* C34.2 : croissance de flotte aerienne arbitree par le portefeuille (1) au lieu de la tache dediee. */
+/* C32 : bonus forfaitaires de classement du fret. 0 = supprimes. */
+/* Devis reel par AITestMode + AIAccounting avant engagement (docs/taches.md C7). */
+/* F-RAIL-ECON-01 : prise en compte du cout du depot dans le capital d'infrastructure rail. */
+RAIL_DEPOT_COST <- false;
+OPS_PER_TICK <- 10000;
+_budgetSignIds <- {};
+_currentTaskName <- null;
+_currentTaskLogged <- false;
+/* Reserve de tresorerie dynamique : adaptee a la taille de la flotte pour liberer le capital
+ * des les premieres annees (15 000 GBP au lieu de 50 000 GBP) et eviter les soldes oisifs. */
+/* P1 : repli empirique du filtre de financabilite. Le facteur rail 1,7
+ * reste applique au capital de construction estime ; les autres modes restent a 1,0. */
+/* P4 : n'exclut de la memoire d'abandon que les refus transitoires de caisse
+ * (CASH / ERR_NOT_ENOUGH_CASH) survenus apres le garde du portefeuille. Reglage
+ * ajoute le 2026-09-08 uniquement pour isoler P4 au banc factoriel P1xP3xP4 sans
+ * dupliquer d'arbre Git ; 0 reproduit le comportement historique pre-P4. */
+/* docs/taches.md S3 undecies (2026-09-03) : les lignes aeriennes rangent des TUILES d'aeroport
+ * dans stationA/stationB, mais le code de hub de builder_air.nut les lisait comme des StationID.
+ * Consequence mesuree graine 42 : la garde `alreadyConnected` toujours fausse -> NEUF liaisons sur
+ * la meme paire de villes en 3 ans, plafond maxRoutes inoperant, et decote de saturation
+ * `/(routes+1)` toujours divisee par 1. 1 = resolution correcte tuile -> StationID ;
+ * 0 = comportement casse d'avant le 2026-09-03, pour que le banc puisse chiffrer l'ecart. */
+/* C15 : cadence minimale d'agrandissement de flotte en jours (7 = hebdomadaire, 365 = defaut annuel historique). */
+AIR_FLEET_CADENCE_DAYS <- 7;
+/* C14 : tampon de cargo au sol pour achat proportionnel (-1 = inactif/defaut). */
+AIR_FLEET_BUFFER <- -1;
+/* Bras experimental : reutiliser un aeroport rentable pour une nouvelle destination. */
+/* V217 : recharge du vivier rail (fret seul) sur tresorerie oisive (orchestrator.nut), figee le 18/11. */
+V217_IDLE_CASH_MIN <- 100000;
+V217_POOL_MIN <- 2;
+V217_LAST_MONTH <- -1;
+V217_REGEN_NO_PAX <- false;
+/* N75-MC: additional 1972+ freight cargo after V217 if RAIL pool is budget-empty.
+ * 0 OFF, 1 SHADOW (only existing pool scan), 2 ON (one additional cargo). */
+N75_MULTI_CARGO <- 0;
+N75_MC_LAST_MONTH <- -1;
+N75_MC_SAVED_MONTH <- -1;
+/* EB-2 : repli sur une nouvelle gare normale quand le quai partage echoue (defaut 0). */
+EB2_NEW_STATION_FALLBACK <- 0;
+/* RAIL-SIBLING lot 1 (inconditionnel depuis le 18/11). */
+/* Majoration plafonnee (realise/prevu de la ligne mere, %) et seuil de saturation (%). */
+RAIL_SIBLING_MAX_REV_PCT <- 200;
+RAIL_SIBLING_TRANSPORTED_PCT <- 60;
+/* RAIL-OPEN (inconditionnel depuis le 18/11). */
+RAIL_OPEN_MIN_CASH <- 250000;
+RAIL_OPEN_CASH_HEADROOM <- 50000;
+/* RAIL-CONSIST : rame fret dimensionnee pour ce % de l'offre calibree (100 = historique). */
+RAIL_CONSIST_PCT <- 100;
+AIR0310_SITE_VALIDITY_STATE <- null;
+/* E10 : Correctif du doublement de flotte routiere au cycle de construction */
+/* C26a : Pricer l'avion de la ligne lors du refleet au lieu du meilleur avion du catalogue */
+/* C16 : Plafond physique de flotte aerienne derive de la cadence d'absorption de la piste */
+/* C52 : le remappage ET_VEHICLE_AUTOREPLACED est inconditionnel. */
+/* C52 : sonde annuelle des remappages; le ledger reste nul hors sonde. */
+C52_AUTOREPLACE_LOG <- false;
+C52_AUTOREPLACE_LEDGER <- null;
+/* C52 : sonde passive de frequence des evenements. Le ledger reste nul hors sonde. */
+C52_EVENT_EXPOSURE_PROBE <- false;
+C52_EVENT_EXPOSURE_LEDGER <- null;
+C52_CRASH_LOG <- false;
+C52_UNPROFITABLE_LOG <- false;
+/* C52 #7 : sonde ET_STATION_FIRST_VEHICLE */
+C52_STATION_FIRST_VEHICLE_LOG <- false;
+/* P3 / A7.5 : une nouvelle ville ou industrie rend le portefeuille obsolete.
+ * Le rafraichissement reactif est rare et evite d'attendre le prochain mois. */
+/* Plafond absolu du pathfinder. Initialisation de repli seulement : Start() le remplace UNE fois
+ * par pathfinder_hard_cap_k. Plafonne a 10 000 (docs/taches.md A3, S0 undecies ter) pour
+ * eliminer le gel de l'IA pendant des mois sur les recherches cheres. */
+HARD_ITERATION_CAP <- 5000;
+/* V100 : memoire d'echec des doublements de voie (defaut 0). */
+/* Garde geometrique rail (adoptee le 20/11/2026, sans reglage) : identite [lead, station_exit],
+ * refus avant depense des raccords terminaux infermables, memoire des TRKFAIL geometriques
+ * persistants, rafraichissement des quais sur un devis STNFAIL (builder_rail.nut). */
+/* V153 : raccordement terminal rail quand le dernier segment est un saut (pont/tunnel).
+ * Defaut 0 pendant qualification. */
+/* V156 : Revalidation incrementale du vivier indexee (0 historique, 1 indexee, 2 controle). */
+const INCR_REVALIDATE_INDEX = 1;
+/* Sondes de tentatives / refus de proximite ferroviaires, OFF par defaut. */
+RAIL_FAILURE_AUDIT <- false;
+/* Optimisation experimentale des regenerations ciblees industrie : dans le fallback multi-cargo,
+ * ignorer un cargo seulement si le catalogue prouve que l'industrie cible n'est ni source d'une
+ * paire valide ni puits d'une paire valide pour CE cargo. Defaut 0 pendant qualification. */
+
+/* C67.4 : carte par blocs dans le reliquat de tick, sans consommateur (contrat C67 S14).
+ * 0 = service absent (defaut), 1 = service construit et rempli en fond. */
+C67_TERRAIN_MAP <- false;
+
+/* C67.6 : sonde passive d'exposition eau (task_terrain.nut), 0 = absente (defaut).
+ * C67_SLACK_HOOK vaut vrai si au moins un service C67 utilise le reliquat de tick. */
+C67_WATER_EXPOSURE <- false;
+C67_SLACK_HOOK <- false;
+C67_WATER_EXPO <- null;
+
+/* C80 tranche 4 : sous C76, une couche industries ou moteurs non aeriens ne regenere que les
+ * modes qui en dependent (rail, route, eau) au lieu du vivier entier. 0 = desactive (defaut). */
+
+C80_MARGINAL_FLOOR_LEDGER <- null;
+
+/* Sonde incrementale air sous probes bit 17 ou groupe 128 */
+C80_AIR_INC_COUNTS <- { full = 0, targeted = 0, none = 0 };
+
+/* C78 etape 2 : annee de la derniere generation aerienne journalisee par la sonde C78 etape 2. */
+C78_GEN_LOG_YEAR <- -1;
+
+/* V86 Variante B : plafond abaisse de routes par aeroport hub.
+ * 0 = plafonds actuels (4 petits/commuter, 12 grands), 1..12 = min(plafond actuel, N). */
+AIR_HUB_MAX_ROUTES <- 3;
+
+/* V89 : debit de recherche A* rail opportuniste.
+ * Avance des tranches supplementaires tant qu'il reste du budget d'opcodes dans le tick,
+ * sans bloquer la file de fond ni changer l'ordre des taches. 0 = desactive (defaut). */
+
+/* PUB-05b (23/11) : l'A* rail est rail_path/rail_path.nut (OpexRailPath), ecrit de zero sous
+ * GPL v3 ; il remplace pathfinder_v90/ (V90, V129, V296), retire faute de licence compatible. */
+
+/* V91 : heuristique ponderee A* rail (weighted A*).
+ * Multiplicateur en pourcentage de l'heuristique octile (cost.astar_weight_pct, pris une fois
+ * a l'initialisation). 100 = admissible ; > 100 accelere la recherche au prix de traces
+ * legerement sub-optimaux. Defaut 120 depuis le 2026-09-24 (decision utilisateur). */
+V91_ASTAR_WEIGHT_PCT <- 120;
+/* PUB-05b : tables de pas de l'A* rail (rail_path/rail_path.nut), partagees par jeu de couts.
+ * Cache d'execution seulement, jamais sauvegarde. */
+OPEX_RAIL_PATH_TABLES <- null;
+
+
+/* V131 : degagement urbain (clearance) de l'A* rail pour eviter les centres-villes
+ * et leurs emprises aeroportuaires futures. Defaut 0 : cout nul. */
+V131_TOWN_CLEARANCE <- false;
+V131_TOWN_CLEAR_BUFFER <- 4;
+
+/* F-EVENT-BACKLOG-01 : ne relancer la reselection dans _c77RemoveSubsidy que si
+ * la purge a reellement retire des candidats de subvention. 0 = inconditionnel (historique) ; defaut 1 depuis le 11/10. */
+
+V147_IN_PHASE <- false;
+V147_TASK_BASE <- -1;
+
+/* V154 : insertion par dichotomie dans OpexProjectInsertDefensive (optimisation opcodes).
+ * 0 = insertion lineaire historique (defaut) ; 1 = dichotomie sur cles mises en cache. */
+SELECT_BISECT_STAMP <- 0;
+/* V279 : re-selection incrementale exacte (0=historique, 1=memoise, 2=controle). */
+V279_RESELECT_MEMO <- 0;
+OPEX_LINES_REVISION <- 0;
+OPEX_AIR_SITE_EPOCH <- 0;
+OPEX_ABANDON_REVISION <- 0;
+OPEX_AIR_ROLLBACK_REVISION <- 0;
+V279_FILTER_STAMP_ID <- 0;
+V279_LAST_MONTH <- -1;
+V279_LAST_LINES_REV <- -1;
+V279_LAST_SITE_EPOCH <- -1;
+V279_LAST_ABND_REV <- -1;
+V279_LAST_ROLLBACK_REV <- -1;
+V279_LAST_HAS_LINES <- null;
+V279_HITS <- 0;
+V279_MISSES <- 0;
+V279_LAST_STATS_MONTH <- -1;
+
+/* V296a : vrai apres un trace groupe different du trace prevu ; la pose groupee s'arrete pour la partie. */
+V296A_MISMATCH <- false;
+
+PO01C_REGEN_SPLIT <- true; // PO-01c : defaut adopte le 23/10
+const C77_INTENT_DEFER_DAYS = 365;
+
+ROAD1Y_SAVED_STOPS <- false; // Set only by reconciliation after Load.
+ROAD1Y_BUS_FIXES <- 0; // 1: pax-only additions; 4: min distance 30; 8: top two districts.
+/* PAX-AIR-FIRST : ablations independantes, strictement OFF par defaut. */
+PAX_AIR_FIRST_RAIL_OFF <- false;
+PAX_AIR_FIRST_AIR_UNBOUNDED <- false;
+PAX_AIR_FIRST_FEEDER_ONLY <- false;
+PFIX_ROAD1Y_WEAK_FIX <- false; // PFIX R2-1 : defaut 0, redemarrer les victimes en depot et cloner avant de vendre
+PFIX_PO01C_ROAD_PAX <- false; // PFIX R1-1 : defaut 0, generer ROAD100_SOLO_PAX/TOWN_BUS dans PO01C sous !ROAD100_SITE_FIRST
+PFIX_V284_GROW_SCORE <- false; // PFIX P1-1 : defaut 0, score homogene project.score et waiting/kDec
+PFIX_V257_ORIGIN_INDUSTRY <- false; // PFIX F2-3 : defaut 0, resoudre l'industrie source par emplacement exact
+PFIX_PO01C_ABANDON_ACK <- false; // PFIX P2-1 : defaut 0, eviter bump lines sur abandon et synchroniser _c76ModeConsumed
+PFIX_CATALOG_MODE_CUT <- false; // PFIX G1 : defaut 0, couper catalogue, regen C80 et boucles de flotte des modes desactives

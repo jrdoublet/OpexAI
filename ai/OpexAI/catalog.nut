@@ -1,0 +1,1496 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 jrdoublet
+/* Etage 0 : le catalogue.
+ *
+ * Mesure 2026-08-28 (results/catalogue_churn.json, 1970-1989) : un rafraichissement complet
+ * coute ~21 500 opcodes. Sonde 1950-2000 (results/catalogue_churn_1950_2000.json) : electrique
+ * 1967, INTERNATIONAL 1990, monorail 2000, maglev pas encore. Une campagne 1970-1989 a deja
+ * l'electrique ; elle ne voit pas INTERNATIONAL. On prend le DERNIER type de rail disponible
+ * (ci-dessous) : en 1970 c'est ELECTRIC, en 2000 ce serait MONO -- hors de nos 20 ans.
+ * Toujours aucun motif d'optimiser le rafraichissement annuel.
+ */
+
+/* Nombre nominal de wagons qui tient dans un quai de `platformLength` tuiles.
+ *
+ * La campagne 42 mesure 8/16 pour la locomotive et 8/16 par wagon. Un quai de p tuiles mesure
+ * p*16, donc 8 + w*8 <= p*16 donne w <= 2*p-1. Cette borne est celle appliquee par
+ * OpexBuildTrains, pas une marge cachee. NoAI 15.3 ne donne pas la longueur avant construction :
+ * le constructeur relit donc chaque vehicule reel et rejette un NewGRF plus long plutot que de
+ * croire cette deduction vanilla. */
+/* Le dernier type disponible est le plus grand RailTypeID numerique. La voie
+ * native trie par ID decroissant ; PO01C conserve sa boucle avec checkpoints. */
+function OpexRailTypePreferred(candidate, chosen)
+{
+  /* RAIL-ENGINE-VALUE bit 4 : voie classique (plus petit type disponible), comme AAAHogEx. */
+  if ((RAIL_ENGINE_VALUE & 4) != 0) return chosen < 0 || candidate < chosen;
+  return candidate > chosen;
+}
+
+/* RAIL-ENGINE-VALUE (bit 1, defaut 0) : a vitesse soutenue egale (bit 2 : a 10 % pres), la
+ * locomotive au cout annuel le plus bas (entretien + achat / duree de vie) l'emporte, pourvu
+ * qu'elle garde au moins la moitie de l'acceleration de l'autre. Le Floss '47' diesel (160 km/h,
+ * prix 18, entretien 140) est ainsi prefere au SH '30' electrique (160 km/h, 26, 180) que la regle
+ * historique "acceleration d'abord" choisissait. Hors bande, la regle historique s'applique. */
+function OpexRailLocoBetter(loco, cruise, acceleration, best, bestSpeed, bestAcceleration)
+{
+  if (best == null) return true;
+  local tol = (RAIL_ENGINE_VALUE & 2) != 0 ? 10 : 0;
+  local hi = cruise > bestSpeed ? cruise : bestSpeed;
+  local lo = cruise > bestSpeed ? bestSpeed : cruise;
+  if (lo * 100 >= hi * (100 - tol)) {
+    local life = loco.ageYears > 0 ? loco.ageYears : 20;
+    local bestLife = best.ageYears > 0 ? best.ageYears : 20;
+    local cost = loco.runningCost + loco.price / life;
+    local bestCost = best.runningCost + best.price / bestLife;
+    if (cost < bestCost) return acceleration * 2 >= bestAcceleration;
+    if (cost > bestCost) return bestAcceleration * 2 < acceleration;
+  }
+  return cruise > bestSpeed || (cruise == bestSpeed && acceleration > bestAcceleration) ||
+      (cruise == bestSpeed && acceleration == bestAcceleration && loco.runningCost < best.runningCost) ||
+      (cruise == bestSpeed && acceleration == bestAcceleration && loco.runningCost == best.runningCost &&
+       loco.price < best.price);
+}
+
+/* RAIL-ENGINE-VALUE bit 8 (defaut 0) : choix ECONOMIQUE generique de la locomotive et du type de
+ * voie. Aucune constante de moteur, d'annee ni d'identifiant de type : tout vient de l'API
+ * (AIEngine, AIRail, AICargo, AIIndustry, AITown), donc valable en NewGRF et quelle que soit
+ * l'annee de depart.
+ *
+ * Critere unique, celui du portefeuille : profit annuel / capital, pour une ligne de reference
+ * (cargo, wagon, nombre de wagons, distance, type de voie) :
+ *   transporte = min(flux de reference corrige du bonus de vitesse de la note de gare,
+ *                    capacite annuelle de la rame)
+ *                capacite = trajets charges/an (vitesse effective avec acceleration,
+ *                OpexRailEffectiveSpeed) x capacite de la rame
+ *   profit     = transporte x AICargo.GetCargoIncome(cargo, distance, jours de trajet)
+ *              - entretien et prix/vie de la locomotive et des wagons
+ *   capital    = infrastructure de la ligne (formule d'OpexLineEconomics : voie, quais, depot)
+ *                + locomotive + wagons
+ * Nos lignes sont bornees par la production (une rame par ligne, mesure du 17/11) : une locomotive
+ * plus rapide ne transporte alors pas plus, elle fait seulement payer chaque unite un peu plus
+ * cher. Le flux de reference d'un cargo est la production mensuelle moyenne de ses producteurs
+ * (industries, sinon villes) x 12 x 50 % de note.
+ *
+ * Locomotive : trois distances de reference (48, 96, 192 tuiles) donnent trois tables ;
+ * OpexLineEconomics prend la plus proche (en rapport) de la ligne. Type de voie : moyenne sur les
+ * cargos du meilleur rapport a 96 tuiles ; la vitesse limite du type (AIRail.GetMaxSpeed)
+ * plafonne les locomotives. Rampes : RAIL_GRADE_FRACTION du trajet a la vitesse soutenable en
+ * montee (pente lue dans les reglages). Non modelises : pannes/fiabilite, entretien d'infrastructure,
+ * attente de plein chargement ; la trainee reste la formule vanilla (hypothese deja
+ * signalee pour OpexRailResistance). */
+function OpexRailEconomicDistances()
+{
+  return [48, 96, 192];
+}
+
+/* Part du trajet supposee en rampe montante : HYPOTHESE de terrain (les rampes ne sont connues
+ * qu'apres A*), la seule constante du choix economique. */
+RAIL_GRADE_FRACTION <- 0.125;
+/* Bande d'ex aequo economique (pour cent) du choix de locomotive. */
+RAIL_ENGINE_TIE_PCT <- 3;
+
+/* Pente du reglage de partie (pour cent), si le modele d'acceleration realiste est actif ; 0 sinon
+ * (le modele original traite les pentes autrement et n'est pas modelise ici). */
+function OpexRailGradeSteepness()
+{
+  if (AIGameSettings.GetValue("vehicle.train_acceleration_model") != 1) return 0;
+  local steep = AIGameSettings.GetValue("vehicle.train_slope_steepness");
+  return steep > 0 ? steep : 0;
+}
+
+/* Vitesse soutenable rame entiere en montee : force = resistance a plat + masse x pente x 100
+ * (cached_slope_resistance de ground_vehicle.cpp, par vehicule sur la rampe). */
+function OpexRailGradeCruise(loco, wagon, wagons, steep)
+{
+  local ceiling = loco.speed;
+  if (wagon.speed > 0 && wagon.speed < ceiling) ceiling = wagon.speed;
+  if (ceiling < 1) return 0;
+  local totalWeight = OpexRailTrainWeight(loco, wagon, wagons);
+  local grade = totalWeight * steep * 100;
+  local parts = 1 + wagons;
+  local low = 0;
+  local high = ceiling;
+  while (low < high) {
+    local middle = (low + high + 1) / 2;
+    if (OpexRailForce(loco, middle) > OpexRailResistance(loco, totalWeight, parts, middle) + grade) low = middle;
+    else high = middle - 1;
+  }
+  return low;
+}
+
+function OpexRailLocoScore(loco, wagon, wagons, cargo, distance, cache, flow, infra)
+{
+  local v = OpexRailEffectiveSpeed(loco, wagon, wagons, distance, null, cache, false, false, true, false);
+  if (v < 1) return null;
+  local oneWay = distance.tofloat() / (0.036 * v);
+  /* Rampes : une part RAIL_GRADE_FRACTION du trajet est parcourue a la vitesse soutenable en montee
+   * (pente du reglage de partie). Une rame incapable de monter est ecartee. */
+  local steep = OpexRailGradeSteepness();
+  if (steep > 0) {
+    local gradeKey = "g|" + loco.id + "|" + wagon.id + "|" + wagons;
+    local vg = 0;
+    if (gradeKey in cache) vg = cache[gradeKey];
+    else { vg = OpexRailGradeCruise(loco, wagon, wagons, steep); cache.rawset(gradeKey, vg); }
+    if (vg < 1) return null;
+    oneWay = distance * (1.0 - RAIL_GRADE_FRACTION) / (0.036 * v) + distance * RAIL_GRADE_FRACTION / (0.036 * vg);
+  }
+  if (oneWay < 1) oneWay = 1.0;
+  local days = oneWay.tointeger();
+  if (days < oneWay) days++;
+  local cycle = 2 * oneWay + OpexRailStationDwellDays(wagon);
+  local legs = AICargo.HasCargoClass(cargo, AICargo.CC_PASSENGERS) ? 2 : 1;
+  local units = wagons * wagon.capacity;
+  /* Une automotrice (capacite propre) ne compte sa capacite que pour son propre cargo. */
+  if (("capacity" in loco) && loco.capacity > 0 && loco.cargo == cargo) units += loco.capacity;
+  local capacity = legs * 365.0 / cycle * units;
+  /* Note de gare : le moteur ajoute (vitesse max du dernier vehicule charge - 85) / 4 points sur
+   * 255 (station_cmd.cpp, last_speed borne a 255). Le flux de reference est calibre a 50 % de note
+   * sur nos rames de 160 km/h (+18 points) ; on ne fait varier que ce terme. */
+  local vmax = loco.speed;
+  if (wagon.speed > 0 && wagon.speed < vmax) vmax = wagon.speed;
+  if (vmax > 255) vmax = 255;
+  local bonus = vmax > 85 ? (vmax - 85) / 4 : 0;
+  local rated = flow * (127.5 + bonus - 18) / 127.5;
+  local carried = rated < capacity ? rated : capacity;
+  local life = loco.ageYears > 0 ? loco.ageYears : 20;
+  local wagonLife = wagon.ageYears > 0 ? wagon.ageYears : 20;
+  local profit = carried * AICargo.GetCargoIncome(cargo, distance, days)
+      - loco.runningCost - loco.price.tofloat() / life
+      - wagons * (wagon.runningCost + wagon.price.tofloat() / wagonLife);
+  local capital = OpexRailLineCapital(infra, distance, wagons) + loco.price + wagons * wagon.price;
+  if (capital <= 0) return null;
+  return profit / capital;
+}
+
+/* Couts unitaires d'infrastructure d'un type de voie, lus une fois par type. */
+function OpexRailInfraCosts(railType)
+{
+  return { track = AIRail.GetBuildCost(railType, AIRail.BT_TRACK),
+           station = AIRail.GetBuildCost(railType, AIRail.BT_STATION),
+           depot = AIRail.GetBuildCost(railType, AIRail.BT_DEPOT) };
+}
+
+/* Capital d'infrastructure d'une ligne, avec la formule d'OpexLineEconomics (voie simple, deux quais
+ * et un depot). Le quai suit la rame. */
+function OpexRailLineCapital(infra, distance, wagons)
+{
+  local platform = OpexRailPlatformLengthForWagons(wagons + 2); // RAIL_PLATFORM_GROWTH_WAGONS, const declaree plus bas
+  local track = infra.track * RAIL_TERRAIN_FACTOR / 100.0;
+  return distance * track + 2 * platform * infra.station + infra.depot;
+}
+
+/* Flux annuel de reference d'un cargo : production mensuelle moyenne d'au plus 16 producteurs,
+ * x 12 mois x 50 % de note. 0 si personne ne le produit. */
+function OpexRailReferenceFlow(cargo)
+{
+  local total = 0;
+  local n = 0;
+  local producers = AIIndustryList_CargoProducing(cargo);
+  for (local i = producers.Begin(); !producers.IsEnd() && n < 16; i = producers.Next()) {
+    total += AIIndustry.GetLastMonthProduction(i, cargo);
+    n++;
+  }
+  if (n == 0) {
+    local towns = AITownList();
+    for (local t = towns.Begin(); !towns.IsEnd() && n < 16; t = towns.Next()) {
+      total += AITown.GetLastMonthProduction(t, cargo);
+      n++;
+    }
+  }
+  if (n == 0 || total <= 0) return 0.0;
+  return total.tofloat() / n * 12 * 0.5;
+}
+
+/* Elimine les locomotives dominees sur toutes les caracteristiques : moins vite, moins puissante,
+ * moins d'effort, plus lourde, plus chere a l'achat et a l'entretien, vie plus courte (un doublon
+ * exact ne garde que le premier). Ne change pas l'optimum ; borne le cout quand un NewGRF propose
+ * des dizaines de locomotives. */
+function OpexRailParetoLocos(locos)
+{
+  local kept = [];
+  for (local i = 0; i < locos.len(); i++) {
+    local a = locos[i];
+    local dominated = false;
+    for (local j = 0; j < locos.len() && !dominated; j++) {
+      if (i == j) continue;
+      local b = locos[j];
+      if (b.speed >= a.speed && b.power >= a.power && b.tractiveEffort >= a.tractiveEffort
+          && b.weight <= a.weight && b.price <= a.price && b.runningCost <= a.runningCost
+          && b.ageYears >= a.ageYears
+          && (b.speed > a.speed || b.power > a.power || b.tractiveEffort > a.tractiveEffort
+              || b.weight < a.weight || b.price < a.price || b.runningCost < a.runningCost
+              || b.ageYears > a.ageYears || j < i)) dominated = true;
+    }
+    if (!dominated) kept.append(a);
+  }
+  return kept;
+}
+
+function OpexRailLocosForType(railType)
+{
+  local limit = AIRail.GetMaxSpeed(railType);
+  local locos = [];
+  local engines = AIEngineList(AIVehicle.VT_RAIL);
+  engines.Valuate(AIEngine.IsWagon);
+  engines.KeepValue(0);
+  for (local e = engines.Begin(); !engines.IsEnd(); e = engines.Next()) {
+    if (!AIEngine.IsBuildable(e) || !AIEngine.CanRunOnRail(e, railType)
+        || !AIEngine.HasPowerOnRail(e, railType)) continue;
+    local speed = AIEngine.GetMaxSpeed(e);
+    local power = AIEngine.GetPower(e);
+    local weight = AIEngine.GetWeight(e);
+    local tractiveEffort = AIEngine.GetMaxTractiveEffort(e);
+    if (speed <= 0 || power <= 0 || weight <= 0 || tractiveEffort <= 0) continue;
+    if (limit > 0 && limit < speed) speed = limit;
+    locos.append({
+      id = e, speed = speed, power = power, weight = weight, tractiveEffort = tractiveEffort,
+      price = AIEngine.GetPrice(e), runningCost = AIEngine.GetRunningCost(e),
+      ageYears = AIEngine.GetMaxAge(e) / 365,
+      capacity = AIEngine.GetCapacity(e), cargo = AIEngine.GetCargoType(e),
+    });
+  }
+  return OpexRailParetoLocos(locos);
+}
+
+/* Le wagon le plus capacitaire par cargo, parmi ceux qui roulent sur ce type (en NewGRF un wagon
+ * peut etre propre a un type de voie). */
+function OpexRailWagonsForType(railType, freightMultiplier)
+{
+  local wagons = {};
+  local engines = AIEngineList(AIVehicle.VT_RAIL);
+  engines.Valuate(AIEngine.IsWagon);
+  engines.KeepValue(1);
+  for (local e = engines.Begin(); !engines.IsEnd(); e = engines.Next()) {
+    if (!AIEngine.IsBuildable(e) || !AIEngine.CanRunOnRail(e, railType)) continue;
+    local cargo = AIEngine.GetCargoType(e);
+    local capacity = AIEngine.GetCapacity(e);
+    if (capacity <= 0) continue;
+    if ((cargo in wagons) && capacity <= wagons[cargo].capacity) continue;
+    local cargoWeight = AICargo.GetWeight(cargo, capacity);
+    if (AICargo.IsFreight(cargo)) cargoWeight *= freightMultiplier;
+    local entry = {
+      id = e, capacity = capacity, speed = AIEngine.GetMaxSpeed(e), price = AIEngine.GetPrice(e),
+      weight = AIEngine.GetWeight(e), fullWeight = AIEngine.GetWeight(e) + cargoWeight,
+      runningCost = AIEngine.GetRunningCost(e), ageYears = AIEngine.GetMaxAge(e) / 365,
+    };
+    if (cargo in wagons) wagons[cargo] = entry;
+    else wagons.rawset(cargo, entry);
+  }
+  return wagons;
+}
+
+function OpexRailEconomicChoices(locos, wagon, maxWagons, cargo, distance, cache, flow, infra)
+{
+  local choices = [];
+  local steep = OpexRailGradeSteepness();
+  if (steep < 1) steep = 1;
+  for (local wagons = 1; wagons <= maxWagons; wagons++) {
+    local scores = [];
+    local bestScore = null;
+    foreach (loco in locos) {
+      local score = OpexRailLocoScore(loco, wagon, wagons, cargo, distance, cache, flow, infra);
+      if (score == null) continue;
+      scores.append({ loco = loco, score = score });
+      if (bestScore == null || score > bestScore) bestScore = score;
+    }
+    /* Les lignes bornees par la production rendent le profit presque insensible a la locomotive
+     * (ecarts de quelques % mesures le 17/11). Dans la bande RAIL_ENGINE_TIE_PCT du meilleur, on
+     * garde la locomotive qui monte le plus vite avec la rame la plus longue du quai : la ligne
+     * grandira (marge de rame, V284) et le relief reel est inconnu avant A*. */
+    local best = null;
+    local bestClimb = -1;
+    foreach (c in scores) {
+      local margin = bestScore > 0 ? bestScore * (100 - RAIL_ENGINE_TIE_PCT) / 100.0
+                                   : bestScore * (100 + RAIL_ENGINE_TIE_PCT) / 100.0;
+      if (c.score < margin) continue;
+      local key = "G|" + c.loco.id + "|" + wagon.id;
+      local climb = 0;
+      if (key in cache) climb = cache[key];
+      else { climb = OpexRailGradeCruise(c.loco, wagon, maxWagons, steep); cache.rawset(key, climb); }
+      if (best == null || climb > bestClimb || (climb == bestClimb && c.score > best.score)) {
+        best = c;
+        bestClimb = climb;
+      }
+    }
+    choices.append(best == null ? null : best.loco);
+  }
+  return choices;
+}
+
+/* Trois tables (une par distance de reference) pour un cargo ; elles partagent le cache de
+ * croisiere et d'acceleration, dont la cle ne depend pas de la distance. Sans producteur connu, le
+ * flux retombe sur une unite : le critere devient alors le profit unitaire par capital. */
+/* Cache annuel : le catalogue rail est rafraichi plusieurs fois par an, mais les tables ne changent
+ * qu'avec l'annee (prix, production), le parc ou le quai. La cle contient tout ce qui les determine. */
+RAIL_ECON_CACHE <- { year = -1, entries = {} };
+
+function OpexRailEconomicCacheGet(key)
+{
+  local year = AIDate.GetYear(AIDate.GetCurrentDate());
+  if (RAIL_ECON_CACHE.year != year) RAIL_ECON_CACHE = { year = year, entries = {} };
+  return (key in RAIL_ECON_CACHE.entries) ? RAIL_ECON_CACHE.entries[key] : null;
+}
+
+function OpexRailEconomicCacheSet(key, value)
+{
+  RAIL_ECON_CACHE.entries.rawset(key, value);
+  return value;
+}
+
+function OpexRailEconomicTables(locos, wagon, maxWagons, cargo, railType)
+{
+  local key = "T|" + cargo + "|" + railType + "|" + maxWagons + "|" + wagon.id;
+  foreach (loco in locos) key += "|" + loco.id;
+  local cached = OpexRailEconomicCacheGet(key);
+  if (cached != null) return cached;
+  local cache = {};
+  local tables = [];
+  local flow = OpexRailReferenceFlow(cargo);
+  if (flow <= 0) flow = 1.0;
+  local infra = OpexRailInfraCosts(railType);
+  foreach (distance in OpexRailEconomicDistances())
+    tables.append({ distance = distance,
+                    choices = OpexRailEconomicChoices(locos, wagon, maxWagons, cargo, distance, cache,
+                                                      flow, infra) });
+  return OpexRailEconomicCacheSet(key, tables);
+}
+
+/* Table de la distance de reference la plus proche, en rapport, de `distance`. */
+function OpexRailEconomicTableFor(tables, distance)
+{
+  local best = null;
+  local bestRatio = 0.0;
+  if (distance < 1) distance = 1;
+  foreach (t in tables) {
+    local ratio = t.distance > distance ? t.distance.tofloat() / distance : distance.tofloat() / t.distance;
+    if (best == null || ratio < bestRatio) { best = t.choices; bestRatio = ratio; }
+  }
+  return best;
+}
+
+/* `types` : AIList des types disponibles. Rend -1 si aucun type n'a de rame evaluable. */
+function OpexRailTypeEconomic(types, maxWagons, freightMultiplier)
+{
+  local key = "R|" + maxWagons + "|" + AIEngineList(AIVehicle.VT_RAIL).Count();
+  for (local t = types.Begin(); !types.IsEnd(); t = types.Next()) key += "|" + t;
+  local cached = OpexRailEconomicCacheGet(key);
+  if (cached != null) return cached;
+  local distance = 96;
+  local refWagons = maxWagons / 2;
+  if (refWagons < 1) refWagons = 1;
+  local flows = {};
+  local chosen = -1;
+  local chosenScore = 0.0;
+  for (local t = types.Begin(); !types.IsEnd(); t = types.Next()) {
+    local locos = OpexRailLocosForType(t);
+    if (locos.len() == 0) continue;
+    local wagons = OpexRailWagonsForType(t, freightMultiplier);
+    local infra = OpexRailInfraCosts(t);
+    local cache = {};
+    local sum = 0.0;
+    local n = 0;
+    foreach (cargo, wagon in wagons) {
+      if (!(cargo in flows)) flows.rawset(cargo, OpexRailReferenceFlow(cargo));
+      local flow = flows[cargo];
+      if (flow <= 0) continue;
+      local best = null;
+      local detail = "";
+      foreach (loco in locos) {
+        local score = OpexRailLocoScore(loco, wagon, refWagons, cargo, distance, cache, flow, infra);
+        detail += " " + AIEngine.GetName(loco.id) + "=" + (score == null ? "x" : (score * 1000).tointeger());
+        if (score != null && (best == null || score > best)) best = score;
+      }
+      if (DECISION_LOG) OpexDiagLog("RAIL_LOCO_VALUE type=" + t + " cargo=" + AICargo.GetCargoLabel(cargo) + " flow=" + flow.tointeger() + detail);
+      if (best != null) { sum += best; n++; }
+    }
+    if (n == 0) continue;
+    local score = sum / n;
+    OpexDiagLog("RAIL_TYPE_VALUE type=" + t + " roi_permille=" + (score * 1000).tointeger()
+        + " locos=" + locos.len() + " cargos=" + n + " capital=" + OpexRailLineCapital(infra, distance, refWagons).tointeger());
+    if (chosen < 0 || score > chosenScore || (score == chosenScore && t > chosen)) {
+      chosen = t;
+      chosenScore = score;
+    }
+  }
+  return OpexRailEconomicCacheSet(key, chosen);
+}
+
+function OpexRailNominalMaxWagons(platformLength)
+{
+  local wagons = 2 * platformLength - 1;
+  return wagons > 0 ? wagons : 0;
+}
+
+/* Marge de croissance des nouvelles rames, exprimee en wagons et non en tuiles : le modele
+ * choisit d'abord le besoin de transport, puis traduit ce besoin en quai. Les longueurs vanilla
+ * mesurees dans la campagne 42 sont 8/16 pour la locomotive et 8/16 par wagon. Une tuile vaut
+ * 16/16, donc DEUX wagons representent exactement une tuile de croissance. C'est la plus petite
+ * marge non nulle qui change la geometrie ; une marge de 1 wagon alternerait sans raison entre 0
+ * et 1 tuile selon la parite du convoi. La securite n'est pas une tuile inventee : le test reel
+ * dans OpexBuildTrains conserve la condition exacte  longueur_rame <= p*16. */
+const RAIL_PLATFORM_GROWTH_WAGONS = 2;
+
+/* Inverse entier de OpexRailNominalMaxWagons. Un wagon utile demande 1 tuile, car 8 + 8 =
+ * 16/16 : c'est le plancher physique, ensuite protege par la mesure reelle du constructeur. */
+function OpexRailPlatformLengthForWagons(wagons)
+{
+  if (wagons < 1) return 0;
+  return (wagons + 2) / 2;
+}
+
+function OpexRailMinimumPlatformLength()
+{
+  return OpexRailPlatformLengthForWagons(1);
+}
+
+/* Le reglage de partie reste une borne haute, jamais la longueur ordonnee par defaut. Ajouter
+ * deux wagons puis inverser la capacite nominale donne le quai voulu ; le min protege le cas ou
+ * la partie limite deja le quai avant que la marge ne tienne. */
+function OpexRailWantedPlatformLength(targetWagons, gameMaximum)
+{
+  local wanted = OpexRailPlatformLengthForWagons(targetWagons + RAIL_PLATFORM_GROWTH_WAGONS);
+  return wanted < gameMaximum ? wanted : gameMaximum;
+}
+
+/* Force de traction et resistance exactement dans les unites du moteur, sur rail plat.
+ *
+ * OpenTTD 15.3 calcule F = min(TE * 1000, power * 746 * 18 / (5 * vitesse)) ; la resistance
+ * mecanique vaut masse * (10 + 15 * (512 + vitesse) / 512), plus la trainee. Les 10 et 15 sont
+ * les deux termes du source (essieux et roulement), pas un abattement calibre. La trainee par
+ * defaut du jeu vaut 14 * clamp(2048 / vmax, 1, 192) * (1 + 3 * elements / 20) * v^2 / 1000.
+ *
+ * L'API ne livre pas la propriete NewGRF de trainee : cette formule est donc verifiee pour les
+ * vehicules de base de la partie gelee, et reste une HYPOTHESE explicitement non generalisable aux
+ * NewGRF. Le calcul est fait au catalogue, jamais dans une boucle de moteurs par candidat. */
+function OpexRailForce(loco, speed)
+{
+  if (speed < 1) speed = 1;
+  local powerForce = (loco.power * 746 * 18) / (speed * 5);
+  local tractiveForce = loco.tractiveEffort * 1000;
+  return powerForce < tractiveForce ? powerForce : tractiveForce;
+}
+
+function OpexRailResistance(loco, totalWeight, parts, speed)
+{
+  local airDrag = 2048 / loco.speed;
+  if (airDrag < 1) airDrag = 1;
+  if (airDrag > 192) airDrag = 192;
+  local rolling = 15 * (512 + speed) / 512;
+  local air = 14 * airDrag * (1 + (3 * parts) / 20.0) * speed * speed / 1000.0;
+  return totalWeight * (10 + rolling) + air;
+}
+
+function OpexRailTrainWeight(loco, wagon, wagons)
+{
+  return loco.weight + wagons * wagon.fullWeight;
+}
+
+/* Vitesse de croisiere possible sur plat, AVANT la distance et les arrets. La recherche dichotomique
+ * ne touche aucune API et a au plus log2(vitesse catalogue) tours ; meme une locomotive a 65 535
+ * km/h en demanderait 16. Ce cout borne est paye une fois par couple loco/wagon/nombre de wagons au
+ * catalogue annuel, et jamais dans le classement de milliers de candidats. */
+function OpexRailCruiseSpeed(loco, wagon, wagons)
+{
+  local ceiling = loco.speed;
+  if (wagon.speed > 0 && wagon.speed < ceiling) ceiling = wagon.speed;
+  if (ceiling < 1) return 0;
+
+  local totalWeight = OpexRailTrainWeight(loco, wagon, wagons);
+  local parts = 1 + wagons;
+  local low = 0;
+  local high = ceiling;
+  while (low < high) {
+    local middle = (low + high + 1) / 2;
+    if (OpexRailForce(loco, middle) > OpexRailResistance(loco, totalWeight, parts, middle)) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return low;
+}
+
+/* Acceleration OpenTTD en vitesse interne par demi-tick : (F - R) / (masse * 4).
+ * L'effort de traction intervient ici, donc une locomotive qui atteint la meme vitesse de croisiere
+ * mais peine a lancer le convoi lourd perd le departage du catalogue. */
+function OpexRailAcceleration(loco, wagon, wagons, speed)
+{
+  local totalWeight = OpexRailTrainWeight(loco, wagon, wagons);
+  if (totalWeight <= 0) return 0;
+  local force = OpexRailForce(loco, speed);
+  local resistance = OpexRailResistance(loco, totalWeight, 1 + wagons, speed);
+  if (force <= resistance) return 0;
+  local acceleration = (force - resistance) / (totalWeight * 4);
+  return acceleration > 0 ? acceleration : 0;
+}
+
+/* Vitesse moyenne entre deux arrets, pas vitesse catalogue. Le moteur met a jour deux fois par tick
+ * et il y a 74 ticks/jour : l'acceleration calculee ci-dessus devient a * 148 / 256 km/h par jour.
+ * On integre un profil trapezoidal (ou triangulaire si la distance est trop courte) avec la conversion
+ * verifiee de docs/mecanique_jeu.md section 2 : 0.036 tuile/jour par km/h.
+ *
+ * Les virages, pentes, ponts et temps de chargement restent INCONNUS avant A*. Le source impose
+ * 61 km/h sur un angle droit et 111 a courbure 2 ; aucun pourcentage de virages n'est invente.
+ * Mesure 2026-08-30 (results/opex_speed_yield.json, n=832) : mediane reel/catalogue 0,96,
+ * reel/traction 1,18. Le 70 % etait trop pessimiste. Pas de retuning. */
+function OpexRailEffectiveSpeed(loco, wagon, wagons, distance, profile = null, cruiseCache = null, freightCruiseProfile = false, freightSpeedDetailProfile = false, freightAccelerationCache = false, freightEffectiveSpeedProfile = false)
+{
+  if (profile != null) {
+    local key = loco.id + "|" + wagon.id + "|" + wagons + "|" + distance;
+    if (key in profile.paxSpeedKeys) profile.paxSpeedCacheableHits++;
+    else {
+      profile.paxSpeedKeys[key] <- true;
+      profile.paxSpeedUniqueKeys++;
+    }
+    if (freightEffectiveSpeedProfile) {
+      if (key in profile.freightSpeedKeys) profile.freightSpeedCacheableHits++;
+      else { profile.freightSpeedKeys[key] <- true; profile.freightSpeedUniqueKeys++; }
+      profile.freightSpeedCalls++;
+    }
+    local cruiseKey = loco.id + "|" + wagon.id + "|" + wagons;
+    if (cruiseKey in profile.paxCruiseKeys) profile.paxCruiseCacheableHits++;
+    else {
+      profile.paxCruiseKeys[cruiseKey] <- true;
+      profile.paxCruiseUniqueKeys++;
+    }
+    /* C41.37 : exactement la cle que le cache fret proposera, mais isolee du pax. */
+    if (freightCruiseProfile) {
+      if (cruiseKey in profile.freightCruiseKeys) profile.freightCruiseCacheableHits++;
+      else {
+        profile.freightCruiseKeys[cruiseKey] <- true;
+        profile.freightCruiseUniqueKeys++;
+      }
+    }
+  }
+  local cruiseKey = loco.id + "|" + wagon.id + "|" + wagons;
+  local cruise = null;
+  if (cruiseCache != null && cruiseKey in cruiseCache) {
+    cruise = cruiseCache[cruiseKey].cruise;
+  } else {
+    local cruiseMark = profile != null ? OpexOpsMeasureBegin() : null;
+    cruise = OpexRailCruiseSpeed(loco, wagon, wagons);
+    if (profile != null) {
+      profile.paxCruiseOps += OpexOpsMeasureEnd(cruiseMark);
+      profile.paxCruiseCalls++;
+      if (freightCruiseProfile) profile.freightCruiseCalls++;
+    }
+    if (cruiseCache != null) cruiseCache[cruiseKey] <- { cruise = cruise };
+  }
+  if (cruise < 1 || distance < 1) return 0;
+
+  local halfSpeed = cruise / 2;
+  if (halfSpeed < 1) halfSpeed = 1;
+  local acceleration = null;
+  if (freightAccelerationCache && cruiseCache != null && cruiseKey in cruiseCache && ("acceleration" in cruiseCache[cruiseKey])) {
+    acceleration = cruiseCache[cruiseKey].acceleration;
+  } else {
+    local accelerationMark = profile != null ? OpexOpsMeasureBegin() : null;
+    acceleration = OpexRailAcceleration(loco, wagon, wagons, halfSpeed);
+    if (profile != null) {
+      local accelerationOps = OpexOpsMeasureEnd(accelerationMark);
+      profile.paxAccelerationOps += accelerationOps;
+      if (freightSpeedDetailProfile) { profile.freightAccelerationOps += accelerationOps; profile.freightAccelerationCalls++; }
+    }
+    if (freightAccelerationCache && cruiseCache != null) cruiseCache[cruiseKey].acceleration <- acceleration;
+  }
+  if (acceleration < 1) return 0;
+  local integrationMark = profile != null ? OpexOpsMeasureBegin() : null;
+  local speedPerDay = acceleration * 148.0 / 256.0;
+  local startDays = cruise / speedPerDay;
+  local startDistance = 0.036 * (cruise / 2.0) * startDays;
+  local travelDays = 0.0;
+
+  if (distance >= 2 * startDistance) {
+    travelDays = 2 * startDays + (distance - 2 * startDistance) / (0.036 * cruise);
+  } else {
+    local peak = sqrt(distance * speedPerDay / 0.036);
+    travelDays = 2 * peak / speedPerDay;
+  }
+  if (travelDays <= 0) {
+    if (profile != null) profile.paxIntegrationOps += OpexOpsMeasureEnd(integrationMark);
+    return 0;
+  }
+  local result = distance / (0.036 * travelDays);
+  if (profile != null) {
+    local integrationOps = OpexOpsMeasureEnd(integrationMark);
+    profile.paxIntegrationOps += integrationOps;
+    if (freightSpeedDetailProfile) { profile.freightIntegrationOps += integrationOps; profile.freightIntegrationCalls++; }
+  }
+  return result;
+}
+
+class OpexCatalog {
+  towns = null;        // [{id, tile, pop}]
+  townAcceptors = null; // cargo -> [{id, tile, pop}]
+  industries = null;   // [{id, tile, type}]
+  producers = null;    // cargo -> [index dans industries]
+  acceptors = null;    // cargo -> [index dans industries]
+  cargos = null;       // [cargo_id]
+  paxCargo = -1;
+  mailCargo = -1;
+  year = 0;
+
+  railType = -1;       // type de rail courant
+  /* `loco` reste le plus rapide CATALOGUE pour le panneau annuel historique. La decision par
+   * ligne passe exclusivement par locoByCargoWagons, qui depend de la rame reellement chargee. */
+  loco = null;
+  railLocos = null;          // profils complets des locomotives avec puissance, masse et TE
+  wagonByCargo = null;       // cargo -> {id, capacity, speed, price, weight, fullWeight}
+  locoByCargoWagons = null;  // cargo -> [1 wagon..max] -> meilleur profil deja choisi
+  locoByCargoWagonsDist = null; // RAIL-ENGINE-VALUE bit 8 : cargo -> [{distance, choices}]
+  wagonChoicesByCargo = null; // M3 probe only: cargo -> tous les wagons + choix loco associes
+  platformLength = 0;        // AIGameSettings station.station_spread, lu une fois par annee
+  maxTrainLength = 0;        // V207 : vehicle.max_train_length (tuiles), lu avec station_spread
+  railCoverage = 0;          // rayon exact de AIStation.STATION_TRAIN, lu avec les autres proprietes rail
+  freightTrainMultiplier = 1;
+  costTrackPerTile = 0;
+  costStation = 0;
+  costRailDepot = 0;
+  costRailSignal = 0;
+
+  airport = null;      // {type, width, height, coverage, price, maintenance} ou null
+  plane = null;        // {id, capacity, speed, price, runningCost, maxOrderDistance} ou null
+  airCombos = null;    // [{kind="large"|"small", airport={...}, plane={...}}] ou null
+  airPlaneChoicesByAirport = null; // M3/C68: airport type -> appareils compatibles
+
+  ships = null;        // [{id, capacity, speed, price, runningCost, maxOrderDistance}]
+  maxShipPrice = 0;
+  costDock = 0;
+  costWaterDepot = 0;
+
+  roadType = -1;              // route normale (pas tram), ou -1 si indisponible
+  /* cargo -> {id, capacity, speed, price, runningCost, ageYears}. Un SEUL vehicule retenu par
+   * cargo (le plus capacitaire), bus comme camion : le choix du type d'arret ne se deduit pas du
+   * moteur mais du cargo (CC_PASSENGERS => arret de bus, sinon aire de chargement), cf.
+   * docs/mecanique_jeu.md S11 -- un bus ne chargera JAMAIS sur une aire de chargement camion. */
+  roadEngineByCargo = null;
+  roadEngineChoicesByCargo = null; // M3 probe only: cargo -> vehicules compatibles
+  maxRoadVehiclePrice = 0;
+  costRoadPerTile = 0;
+  costRoadBusStop = 0;
+  costRoadTruckStop = 0;
+  costRoadDepot = 0;
+
+  /* Frontieres modales de l'epoque (OpexRefreshEpochBounds). Null avant le
+   * premier refresh ; les generateurs passent par OpexCatalogBounds. */
+  bounds = null;
+  _ticksAnchorDate = -1;
+  _ticksAnchorTick = -1;
+
+  constructor()
+  {
+    this.towns = [];
+    this.townAcceptors = {};
+    this.industries = [];
+    this.producers = {};
+    this.acceptors = {};
+    this.cargos = [];
+    this.wagonByCargo = {};
+    this.railLocos = [];
+    this.locoByCargoWagons = {};
+    this.locoByCargoWagonsDist = {};
+    this.wagonChoicesByCargo = {};
+    this.ships = [];
+    this.roadEngineByCargo = {};
+    this.roadEngineChoicesByCargo = {};
+    this.airPlaneChoicesByAirport = {};
+    this.bounds = null;
+    this._ticksAnchorDate = -1;
+    this._ticksAnchorTick = -1;
+  }
+
+  function refresh(budget, year);
+  function _refreshCargos();
+  function _refreshTowns();
+  function _refreshIndustries();
+  function _refreshRail();
+  function _refreshAir();
+  function _refreshWater();
+  function _refreshRoad();
+  function _cargoArray(list);
+}
+
+/* M3/G12 : reproduit STRICTEMENT le departage locomotive courant pour un wagon alternatif.
+ * Cette fonction n'est appelee que lorsque equipment_roi_probe=1 ; le chemin livre continue
+ * d'utiliser la boucle historique inline ci-dessous. Le resultat sert uniquement a donner a
+ * OpexLineEconomics un couple wagon/locomotive physiquement coherent pour le diagnostic. */
+function OpexM3RailLocoChoices(railLocos, wagon, maxWagons)
+{
+  local choices = [];
+  if (railLocos == null || railLocos.len() == 0 || maxWagons < 1) return choices;
+  for (local wagons = 1; wagons <= maxWagons; wagons++) {
+    local best = null;
+    local bestSpeed = -1;
+    local bestAcceleration = -1;
+    local topCeiling = railLocos[0].speed;
+    if (wagon.speed > 0 && wagon.speed < topCeiling) topCeiling = wagon.speed;
+    local topSustained = false;
+    foreach (loco in railLocos) {
+      if (topSustained && loco.speed < topCeiling && (RAIL_ENGINE_VALUE & 2) == 0) continue;
+      local ceiling = loco.speed;
+      if (wagon.speed > 0 && wagon.speed < ceiling) ceiling = wagon.speed;
+      local totalWeight = loco.weight + wagons * wagon.fullWeight;
+      local parts = 1 + wagons;
+      local airDrag = 2048 / loco.speed;
+      if (airDrag < 1) airDrag = 1;
+      if (airDrag > 192) airDrag = 192;
+      local airFactor = 14 * airDrag * (1 + (3 * parts) / 20.0) / 1000.0;
+      local low = 0;
+      local high = ceiling;
+      while (low < high) {
+        local middle = (low + high + 1) / 2;
+        local powerForce = (loco.power * 746 * 18) / (middle * 5);
+        local tractiveForce = loco.tractiveEffort * 1000;
+        local force = powerForce < tractiveForce ? powerForce : tractiveForce;
+        local rolling = 15 * (512 + middle) / 512;
+        local resistance = totalWeight * (10 + rolling) + airFactor * middle * middle;
+        if (force > resistance) low = middle;
+        else high = middle - 1;
+      }
+      local cruise = low;
+      if (cruise < 1) continue;
+      if (loco.id == railLocos[0].id && cruise == topCeiling) topSustained = true;
+      local halfSpeed = cruise / 2;
+      if (halfSpeed < 1) halfSpeed = 1;
+      local powerForce = (loco.power * 746 * 18) / (halfSpeed * 5);
+      local tractiveForce = loco.tractiveEffort * 1000;
+      local force = powerForce < tractiveForce ? powerForce : tractiveForce;
+      local rolling = 15 * (512 + halfSpeed) / 512;
+      local resistance = totalWeight * (10 + rolling) + airFactor * halfSpeed * halfSpeed;
+      local acceleration = force > resistance ? (force - resistance) / (totalWeight * 4) : 0;
+      if ((RAIL_ENGINE_VALUE & 1) != 0
+            ? OpexRailLocoBetter(loco, cruise, acceleration, best, bestSpeed, bestAcceleration)
+            : (best == null || cruise > bestSpeed ||
+          (cruise == bestSpeed && acceleration > bestAcceleration) ||
+          (cruise == bestSpeed && acceleration == bestAcceleration && loco.runningCost < best.runningCost) ||
+          (cruise == bestSpeed && acceleration == bestAcceleration && loco.runningCost == best.runningCost &&
+           loco.price < best.price))) {
+        best = loco;
+        bestSpeed = cruise;
+        bestAcceleration = acceleration;
+      }
+    }
+    choices.append(best);
+  }
+  return choices;
+}
+
+/* Le materiel roulant disponible AUJOURD'HUI, et ce que coute la voie.
+ *
+ * Necessaire a l'etage 1 : sans la vitesse du convoi on ne sait pas estimer le temps de trajet,
+ * donc pas les penalites de retard, qui sont la moitie du revenu (docs/mecanique_jeu.md S1-2).
+ * Le parc evolue reellement : sur 20 ans le nombre de moteurs routiers passe de 12 a 22 et les
+ * avions de 13 a 18 (results/catalogue_churn.json) -- d'ou le rafraichissement annuel. */
+function OpexCatalog::_refreshRail()
+{
+  this.loco = null;
+  this.railLocos = [];
+  this.wagonByCargo = {};
+  this.locoByCargoWagons = {};
+    this.locoByCargoWagonsDist = {};
+  this.wagonChoicesByCargo = {};
+
+  /* `station_spread` est la borne que CmdBuildRailStation controle sur `length`. Dans OpenTTD
+   * 15.3 elle est entiere, entre 4 et 64, et vaut 12 dans la configuration gelee ; on lit donc la
+   * partie, jamais un "7" suppose. Une valeur invalide signifie API/reglage indisponible : mieux
+   * vaut alors rendre le rail non constructible que fabriquer une longueur silencieuse. */
+  this.platformLength = AIGameSettings.GetValue("station.station_spread");
+  this.maxTrainLength = AIGameSettings.GetValue("vehicle.max_train_length");
+  this.freightTrainMultiplier = AIGameSettings.GetValue("vehicle.freight_trains");
+  this.railCoverage = AIStation.GetCoverageRadius(AIStation.STATION_TRAIN);
+  if (this.platformLength < 1 || this.freightTrainMultiplier < 1 || this.railCoverage < 1) return;
+  if (PFIX_CATALOG_MODE_CUT && !MODE_RAIL) {
+    this.railType = -1;
+    this.costTrackPerTile = 0;
+    this.costStation = 0;
+    this.costRailDepot = 0;
+    this.costRailSignal = 0;
+    return;
+  }
+
+  /* Dernier type disponible. 1970 = ELECTRIC (intro 1967). 2000 = MONO : ne pas
+   * allonger une campagne jusque-la sans figer le type. Maglev pas encore en 2000
+   * (results/catalogue_churn_1950_2000.json). */
+  local types = AIRailTypeList();
+  types.Valuate(AIRail.IsRailTypeAvailable);
+  types.KeepValue(1);
+  /* Le choix ne doit PAS dependre de l'ordre d'iteration : le tri par defaut d'une AIList est
+   * SORT_BY_VALUE DECROISSANT (script_list.cpp:397-403), donc le Valuate ci-dessus change cet
+   * ordre. L'ancien "le dernier gagne" rendait le type de rail dependant du tri -- invisible a
+   * 3 ans de partie ou un seul type est disponible, et instable des qu'il y en a plusieurs.
+   * Voir docs/mecanique_jeu.md S15.1. */
+  /* OPCODE-AILIST L3 : la cle de tri native est l'ID, pas la valeur disponible=1.
+   * Ainsi Begin() rend exactement le maximum numerique choisi historiquement. */
+  types.Sort(AIList.SORT_BY_ITEM, AIList.SORT_DESCENDING);
+  if ((RAIL_ENGINE_VALUE & 4) != 0) types.Sort(AIList.SORT_BY_ITEM, AIList.SORT_ASCENDING);
+  local chosen = types.IsEmpty() ? -1 : types.Begin();
+  if ((RAIL_ENGINE_VALUE & 8) != 0)
+    chosen = OpexRailTypeEconomic(types, OpexRailNominalMaxWagons(this.platformLength), this.freightTrainMultiplier);
+  if (chosen < 0) return;
+  this.railType = chosen;
+  AIRail.SetCurrentRailType(chosen);
+  this.costTrackPerTile = AIRail.GetBuildCost(chosen, AIRail.BT_TRACK);
+  this.costStation = AIRail.GetBuildCost(chosen, AIRail.BT_STATION);
+  /* Le depot rail etait le seul cout d'infrastructure absent du modele, alors que la route
+   * et l'eau comptent le leur et que builder_rail.nut le paie reellement. */
+  this.costRailDepot = AIRail.GetBuildCost(chosen, AIRail.BT_DEPOT);
+  this.costRailSignal = AIRail.GetBuildCost(chosen, AIRail.BT_SIGNAL);
+
+  local engines = AIEngineList(AIVehicle.VT_RAIL);
+  engines.Valuate(AIEngine.IsBuildable);
+  engines.KeepValue(1);
+  for (local e = engines.Begin(); !engines.IsEnd(); e = engines.Next()) {
+    if (AIEngine.IsWagon(e)) {
+      local cargo = AIEngine.GetCargoType(e);
+      local capacity = AIEngine.GetCapacity(e);
+      if (capacity <= 0) continue;
+      /* Un seul wagon retenu par cargo : le plus capacitaire. La sonde M3 conserve en parallele
+       * les alternatives SANS changer ce departage, y compris son premier-gagne en cas d'egalite. */
+      local replaces = !(cargo in this.wagonByCargo) || capacity > this.wagonByCargo[cargo].capacity;
+      if (!replaces && !EQUIPMENT_ROI_PROBE) continue;
+      local cargoWeight = AICargo.GetWeight(cargo, capacity);
+      /* Le moteur applique `vehicle.freight_trains` aux seuls cargos fret dans Train::GetWeight.
+       * AICargo.GetWeight livre le poids nu, donc le multiplicateur lu ci-dessus est indispensable
+       * pour que la masse utilisee par le catalogue soit celle du convoi plein reel. */
+      if (AICargo.IsFreight(cargo)) cargoWeight *= this.freightTrainMultiplier;
+      local entry = {
+        id = e, capacity = capacity, speed = AIEngine.GetMaxSpeed(e), price = AIEngine.GetPrice(e),
+        weight = AIEngine.GetWeight(e), fullWeight = AIEngine.GetWeight(e) + cargoWeight,
+        runningCost = AIEngine.GetRunningCost(e), ageYears = AIEngine.GetMaxAge(e) / 365,
+      };
+      if (EQUIPMENT_ROI_PROBE) {
+        if (!(cargo in this.wagonChoicesByCargo)) this.wagonChoicesByCargo.rawset(cargo, []);
+        this.wagonChoicesByCargo[cargo].append(entry);
+      }
+      if (replaces) {
+        if (cargo in this.wagonByCargo) this.wagonByCargo[cargo] = entry;
+        else this.wagonByCargo.rawset(cargo, entry);
+      }
+    } else {
+      /* [!] PIEGE D'API, verifie le 2026-08-28. CanRunOnRail() ne suffit PAS : une locomotive
+       * ELECTRIQUE "peut rouler" sur une voie non electrifiee (elle peut y etre tractee), mais
+       * elle n'y a AUCUNE PUISSANCE. Symptome observe : AIEngine.IsBuildable et CanRunOnRail
+       * rendaient tous deux vrai, le depot etait valide, la tresorerie suffisante -- et
+       * AIVehicle.BuildVehicle echouait avec ERR_UNKNOWN sur les 100 tentatives. Le diagnostic
+       * qui a tranche : engine_rail = 1 (electrifie) contre depot_rail = 0.
+       * HasPowerOnRail() est le bon predicat. */
+      if (!AIEngine.CanRunOnRail(e, chosen)) continue;
+      if (!AIEngine.HasPowerOnRail(e, chosen)) continue;
+      local speed = AIEngine.GetMaxSpeed(e);
+      local power = AIEngine.GetPower(e);
+      local weight = AIEngine.GetWeight(e);
+      local tractiveEffort = AIEngine.GetMaxTractiveEffort(e);
+      if (speed <= 0 || power <= 0 || weight <= 0 || tractiveEffort <= 0) continue;
+      local entry = {
+        id = e, speed = speed, power = power, weight = weight, tractiveEffort = tractiveEffort,
+        price = AIEngine.GetPrice(e), runningCost = AIEngine.GetRunningCost(e),
+        ageYears = AIEngine.GetMaxAge(e) / 365,
+      };
+      this.railLocos.append(entry);
+      /* Conserve seulement le comparateur historique pour OL annuel : il ne decide plus RIEN. */
+      if (this.loco == null || speed > this.loco.speed) {
+        this.loco = entry;
+      }
+    }
+  }
+
+  /* Precalcul de la seule boucle couteuse : cargos x compositions x locomotives, une fois par
+   * annee. Le catalogue complet mesurait 21 492 opcodes (0,008 % du budget de partie) ; cette
+   * table supprime ensuite toute boucle moteur du chemin OpexLineEconomics, appele pour chaque
+   * paire ville/industrie. La cle est le nombre de wagons, donc la selection voit bien la charge
+   * reelle, pas une rame fictive de cinq wagons.
+   *
+   * La dichotomie est ecrite ici, plutot que par les appels imbriques OpexRailCruiseSpeed(),
+   * OpexRailForce() et OpexRailResistance(). A 12 tuiles, au plus 23 wagons et 16 iterations par
+   * moteur, les appels Squirrel faisaient monter ce seul cache a 1,12 M opcodes/an au smoke 42,
+   * soit 52 fois les 21 492 du catalogue mesure. Les memes equations, deroulees sans fermeture ni
+   * appel, gardent le cout annualise et mesurable par `cat_rail`, sans payer ce facteur 52.
+   *
+   * Les profils sont tries par vitesse decroissante avant ce cache. Si le premier soutient son
+   * plafond, un moteur dont le plafond est inferieur ne peut mathematiquement ni le depasser ni
+   * l'egaler : il est saute. Les seuls ex aequo possibles (meme plafond de wagon ou de moteur)
+   * restent evalues pour conserver le departage acceleration, cout annuel, capital. C'est une
+   * equivalence, pas un echantillonnage : si le plus rapide ne soutient pas son plafond, tous les
+   * moteurs sont de nouveau evalues. Le smoke 42 mesure apres ce garde 175 768 opcodes en 1970,
+   * soit 0,066 % du meme budget ou 21 492 valaient 0,008 % : c'est un cout annuel borne et non
+   * le million repete qui aurait rendu le catalogue disproportionne. */
+  if ((RAIL_ENGINE_VALUE & 8) != 0) {
+    this.railLocos = OpexRailLocosForType(chosen);
+    this.wagonByCargo = OpexRailWagonsForType(chosen, this.freightTrainMultiplier);
+  }
+  local maxWagons = OpexRailNominalMaxWagons(this.platformLength);
+  if (maxWagons < 1 || this.railLocos.len() == 0) return;
+  for (local i = 1; i < this.railLocos.len(); i++) {
+    local current = this.railLocos[i];
+    local j = i - 1;
+    while (j >= 0 && this.railLocos[j].speed < current.speed) {
+      this.railLocos[j + 1] = this.railLocos[j];
+      j--;
+    }
+    this.railLocos[j + 1] = current;
+  }
+  foreach (cargo, wagon in this.wagonByCargo) {
+    if ((RAIL_ENGINE_VALUE & 8) != 0) {
+      local tables = OpexRailEconomicTables(this.railLocos, wagon, maxWagons, cargo, chosen);
+      this.locoByCargoWagonsDist.rawset(cargo, tables);
+      this.locoByCargoWagons.rawset(cargo, OpexRailEconomicTableFor(tables, 96));
+      continue;
+    }
+    local choices = [];
+    for (local wagons = 1; wagons <= maxWagons; wagons++) {
+      local best = null;
+      local bestSpeed = -1;
+      local bestAcceleration = -1;
+      local topCeiling = this.railLocos[0].speed;
+      if (wagon.speed > 0 && wagon.speed < topCeiling) topCeiling = wagon.speed;
+      local topSustained = false;
+      foreach (loco in this.railLocos) {
+        if (topSustained && loco.speed < topCeiling && (RAIL_ENGINE_VALUE & 2) == 0) continue;
+        local ceiling = loco.speed;
+        if (wagon.speed > 0 && wagon.speed < ceiling) ceiling = wagon.speed;
+        local totalWeight = loco.weight + wagons * wagon.fullWeight;
+        local parts = 1 + wagons;
+        local airDrag = 2048 / loco.speed;
+        if (airDrag < 1) airDrag = 1;
+        if (airDrag > 192) airDrag = 192;
+        local airFactor = 14 * airDrag * (1 + (3 * parts) / 20.0) / 1000.0;
+        local low = 0;
+        local high = ceiling;
+        while (low < high) {
+          local middle = (low + high + 1) / 2;
+          local powerForce = (loco.power * 746 * 18) / (middle * 5);
+          local tractiveForce = loco.tractiveEffort * 1000;
+          local force = powerForce < tractiveForce ? powerForce : tractiveForce;
+          local rolling = 15 * (512 + middle) / 512;
+          local resistance = totalWeight * (10 + rolling) + airFactor * middle * middle;
+          if (force > resistance) low = middle;
+          else high = middle - 1;
+        }
+        local cruise = low;
+        if (cruise < 1) continue;
+        if (loco.id == this.railLocos[0].id && cruise == topCeiling) topSustained = true;
+        local halfSpeed = cruise / 2;
+        if (halfSpeed < 1) halfSpeed = 1;
+        local powerForce = (loco.power * 746 * 18) / (halfSpeed * 5);
+        local tractiveForce = loco.tractiveEffort * 1000;
+        local force = powerForce < tractiveForce ? powerForce : tractiveForce;
+        local rolling = 15 * (512 + halfSpeed) / 512;
+        local resistance = totalWeight * (10 + rolling) + airFactor * halfSpeed * halfSpeed;
+        local acceleration = force > resistance ? (force - resistance) / (totalWeight * 4) : 0;
+        /* Regle de selection, dans cet ordre : vitesse soutenable de la rame pleine, acceleration
+         * a mi-vitesse (donc effort de traction et puissance), cout annuel, puis capital. Les deux
+         * derniers ne servent qu'a departager deux locomotives que la physique rend equivalentes. */
+        if ((RAIL_ENGINE_VALUE & 1) != 0
+            ? OpexRailLocoBetter(loco, cruise, acceleration, best, bestSpeed, bestAcceleration)
+            : (best == null || cruise > bestSpeed ||
+            (cruise == bestSpeed && acceleration > bestAcceleration) ||
+            (cruise == bestSpeed && acceleration == bestAcceleration && loco.runningCost < best.runningCost) ||
+            (cruise == bestSpeed && acceleration == bestAcceleration && loco.runningCost == best.runningCost &&
+             loco.price < best.price))) {
+          best = loco;
+          bestSpeed = cruise;
+          bestAcceleration = acceleration;
+        }
+      }
+      choices.append(best);
+    }
+    this.locoByCargoWagons.rawset(cargo, choices);
+  }
+  if (EQUIPMENT_ROI_PROBE) {
+    foreach (cargo, wagons in this.wagonChoicesByCargo) {
+      if (!(cargo in this.wagonByCargo) || !(cargo in this.locoByCargoWagons)) continue;
+      local selectedId = this.wagonByCargo[cargo].id;
+      foreach (wagon in wagons) {
+        wagon.m3LocoChoices <- (wagon.id == selectedId)
+            ? this.locoByCargoWagons[cargo]
+            : OpexM3RailLocoChoices(this.railLocos, wagon, maxWagons);
+      }
+    }
+  }
+}
+
+/* Deux types d'aeroports et appareils :
+ * 1. Grand aeroport (AT_INTERNATIONAL, AT_METROPOLITAN, AT_LARGE) avec gros avion (PT_BIG_PLANE) ou petit avion
+ * 2. Petit aeroport (AT_COMMUTER, AT_SMALL) avec petit avion (PT_SMALL_PLANE) STRICTEMENT (les gros avions y sont interdits). */
+function OpexCatalog::_refreshAir()
+{
+  this.airport = null;
+  this.plane = null;
+  this.airCombos = [];
+  this.airPlaneChoicesByAirport = {};
+  if (this.paxCargo < 0) return;
+  /* V166 : mode AIR coupe = catalogue vide, le meme chemin que sans appareil disponible. */
+  if (!MODE_AIR) return;
+
+  local airportLargeTypes = [
+    { type = AIAirport.AT_INTERNATIONAL, allowBig = true, name = "INTERNATIONAL" },
+    { type = AIAirport.AT_METROPOLITAN, allowBig = true, name = "METROPOLITAN" },
+    { type = AIAirport.AT_LARGE, allowBig = true, name = "LARGE" },
+  ];
+  local airportSmallTypes = [
+    { type = AIAirport.AT_COMMUTER, allowBig = false, name = "COMMUTER" },
+    { type = AIAirport.AT_SMALL, allowBig = false, name = "SMALL" },
+  ];
+
+  local engines = AIEngineList(AIVehicle.VT_AIR);
+  engines.Valuate(AIEngine.IsBuildable);
+  engines.KeepValue(1);
+  /* OPCODE-AILIST L5 : refit passagers evalue une seule fois en natif sur la
+   * liste deja construite, avant les parcours repetes par type d'aeroport. */
+  engines.Valuate(AIEngine.CanRefitCargo, this.paxCargo);
+  engines.KeepValue(1);
+  local keepPlaneChoices = true;
+
+  // 1. Combo Grand Aeroport + Avion compatible
+  foreach (choice in airportLargeTypes) {
+    if (!AIAirport.IsValidAirportType(choice.type)) continue;
+    local best = null;
+    local probeChoices = [];
+    for (local e = engines.Begin(); !engines.IsEnd(); e = engines.Next()) {
+      local planeType = AIEngine.GetPlaneType(e);
+      if (planeType != AIAirport.PT_SMALL_PLANE && planeType != AIAirport.PT_BIG_PLANE) continue;
+      local capacity = AIEngine.GetCapacity(e);
+      local speed = AIEngine.GetMaxSpeed(e);
+      if (capacity <= 0) continue;
+      local isBig = (planeType == AIAirport.PT_BIG_PLANE);
+      local bestIsBig = (best != null && best.isBig);
+      local replaces = best == null || (isBig && !bestIsBig) ||
+          (isBig == bestIsBig && (capacity > best.capacity || (capacity == best.capacity && speed > best.speed)));
+      if (!replaces && !keepPlaneChoices) continue;
+      local entry = {
+        id = e, defaultCargo = AIEngine.GetCargoType(e), capacity = capacity, speed = speed,
+        price = AIEngine.GetPrice(e), runningCost = AIEngine.GetRunningCost(e),
+        maxOrderDistance = AIEngine.GetMaximumOrderDistance(e), planeType = planeType, isBig = isBig,
+        ageYears = AIEngine.GetMaxAge(e) / 365, mailCapacity = -1,
+      };
+      if (keepPlaneChoices) probeChoices.append(entry);
+      if (replaces) best = entry;
+    }
+    if (keepPlaneChoices && probeChoices.len() > 0) {
+      this.airPlaneChoicesByAirport.rawset(choice.type, probeChoices);
+    }
+    if (best != null) {
+      local ap = {
+        type = choice.type,
+        kind = "large",
+        name = choice.name,
+        allowBig = true,
+        width = AIAirport.GetAirportWidth(choice.type),
+        height = AIAirport.GetAirportHeight(choice.type),
+        coverage = AIAirport.GetAirportCoverageRadius(choice.type),
+        price = AIAirport.GetPrice(choice.type),
+        maintenance = AIAirport.GetMonthlyMaintenanceCost(choice.type),
+      };
+      this.airCombos.append({ kind = "large", airport = ap, plane = best });
+      if (this.airport == null) {
+        this.airport = ap;
+        this.plane = best;
+      }
+    }
+  }
+
+  // 2. Combo Petit Aeroport + Petit Avion (strictement PT_SMALL_PLANE)
+  foreach (choice in airportSmallTypes) {
+    if (!AIAirport.IsValidAirportType(choice.type)) continue;
+    local best = null;
+    local probeChoices = [];
+    for (local e = engines.Begin(); !engines.IsEnd(); e = engines.Next()) {
+      local planeType = AIEngine.GetPlaneType(e);
+      // Regle d'or : les gros avions ne vont JAMAIS dans les petits aeroports
+      if (planeType != AIAirport.PT_SMALL_PLANE) continue;
+      local capacity = AIEngine.GetCapacity(e);
+      local speed = AIEngine.GetMaxSpeed(e);
+      if (capacity <= 0) continue;
+      local replaces = best == null || capacity > best.capacity ||
+          (capacity == best.capacity && speed > best.speed);
+      if (!replaces && !keepPlaneChoices) continue;
+      local entry = {
+        id = e, defaultCargo = AIEngine.GetCargoType(e), capacity = capacity, speed = speed,
+        price = AIEngine.GetPrice(e), runningCost = AIEngine.GetRunningCost(e),
+        maxOrderDistance = AIEngine.GetMaximumOrderDistance(e), planeType = planeType, isBig = false,
+        ageYears = AIEngine.GetMaxAge(e) / 365, mailCapacity = -1,
+      };
+      if (keepPlaneChoices) probeChoices.append(entry);
+      if (replaces) best = entry;
+    }
+    if (keepPlaneChoices && probeChoices.len() > 0) {
+      this.airPlaneChoicesByAirport.rawset(choice.type, probeChoices);
+    }
+    if (best != null) {
+      local ap = {
+        type = choice.type,
+        kind = "small",
+        name = choice.name,
+        allowBig = false,
+        width = AIAirport.GetAirportWidth(choice.type),
+        height = AIAirport.GetAirportHeight(choice.type),
+        coverage = AIAirport.GetAirportCoverageRadius(choice.type),
+        price = AIAirport.GetPrice(choice.type),
+        maintenance = AIAirport.GetMonthlyMaintenanceCost(choice.type),
+      };
+      this.airCombos.append({ kind = "small", airport = ap, plane = best });
+      if (this.airport == null) {
+        this.airport = ap;
+        this.plane = best;
+      }
+    }
+  }
+  OpexDiagLog("_refreshAir: combos=" + this.airCombos.len()
+    + " airport=" + (this.airport != null ? "YES" : "NULL")
+    + " plane=" + (this.plane != null ? "YES" : "NULL"));
+}
+
+/* Coques refittables : la capacite reelle depend du depot et du GRF. */
+function OpexCatalog::_refreshWater()
+{
+  this.ships = [];
+  this.maxShipPrice = 0;
+  this.costDock = AIMarine.GetBuildCost(AIMarine.BT_DOCK);
+  this.costWaterDepot = AIMarine.GetBuildCost(AIMarine.BT_DEPOT);
+  if (this.paxCargo < 0) return;
+  /* V166 : mode EAU coupe = aucune coque au catalogue. */
+  if (!MODE_WATER) return;
+  local engines = AIEngineList(AIVehicle.VT_WATER);
+  engines.Valuate(AIEngine.IsBuildable);
+  engines.KeepValue(1);
+  for (local e = engines.Begin(); !engines.IsEnd(); e = engines.Next()) {
+    if (!AIEngine.CanRefitCargo(e, this.paxCargo)) continue;
+    local capacity = AIEngine.GetCapacity(e);
+    local speed = AIEngine.GetMaxSpeed(e);
+    local ship = { id = e, capacity = capacity, speed = speed, price = AIEngine.GetPrice(e),
+                   runningCost = AIEngine.GetRunningCost(e),
+                   maxOrderDistance = AIEngine.GetMaximumOrderDistance(e) };
+    this.ships.append(ship);
+    if (ship.price > this.maxShipPrice) this.maxShipPrice = ship.price;
+  }
+}
+
+/* Route : l'equivalent du piege CanRunOnRail/HasPowerOnRail existe bien. Un vehicule peut etre
+ * compatible avec un type de route sans y avoir de puissance ; le catalogue exige les deux, puis
+ * CanRefitCargo (ou le cargo deja configure) avant de le proposer au constructeur. La capacite
+ * apres refit reste verifiee dans builder_road.nut, car un NewGRF peut la changer selon le depot.
+ *
+ * Depuis le 2026-08-29 le catalogue ne connait plus "les bus" mais UN vehicule par cargo, bus ou
+ * camion : le mode route ne construit plus une liaison passagers unique mais autant de petites
+ * lignes que le classement en propose, dont des lignes de fret (voir candidates.nut,
+ * OpexRoadCandidates). Le cout des DEUX types d'arret est releve, car le type est impose par le
+ * cargo, pas choisi.
+ *
+ * [!] Vehicules articules ECARTES : ils ne peuvent pas utiliser un arret en cul-de-sac, et c'est la
+ * seule disposition que builder_road.nut sait poser (les arrets traversants ont ete mesures puis
+ * abandonnes -- 912 232 opcodes pour aucun gain, cf. docs/opexai_mode_route et le commentaire en
+ * tete de builder_road.nut). Les laisser entrer donnerait un moteur que le depot accepte de
+ * construire et que l'arret refuse de charger. */
+function OpexCatalog::_refreshRoad()
+{
+  this.roadType = -1;
+  this.roadEngineByCargo = {};
+  this.roadEngineChoicesByCargo = {};
+  this.maxRoadVehiclePrice = 0;
+  this.costRoadPerTile = 0;
+  this.costRoadBusStop = 0;
+  this.costRoadTruckStop = 0;
+  this.costRoadDepot = 0;
+  if (PFIX_CATALOG_MODE_CUT && !MODE_ROAD) return;
+  if (!AIRoad.IsRoadTypeAvailable(AIRoad.ROADTYPE_ROAD)) return;
+  this.roadType = AIRoad.ROADTYPE_ROAD;
+  AIRoad.SetCurrentRoadType(this.roadType);
+  this.costRoadPerTile = AIRoad.GetBuildCost(this.roadType, AIRoad.BT_ROAD);
+  this.costRoadBusStop = AIRoad.GetBuildCost(this.roadType, AIRoad.BT_BUS_STOP);
+  this.costRoadTruckStop = AIRoad.GetBuildCost(this.roadType, AIRoad.BT_TRUCK_STOP);
+  this.costRoadDepot = AIRoad.GetBuildCost(this.roadType, AIRoad.BT_DEPOT);
+
+  /* Deux passes plutot qu'une boucle imbriquee sur AIEngineList : les predicats chers
+   * (IsBuildable, CanRunOnRoad, HasPowerOnRoad, IsArticulated) sont evalues UNE fois par moteur,
+   * et seul CanRefitCargo -- le seul qui depende du cargo -- est repaye pour chaque paire. Sur le
+   * parc mesure (12 a 22 moteurs routiers en 20 ans, results/catalogue_churn.json) et une douzaine de
+   * cargos, cela reste tres en dessous du budget annuel du catalogue. */
+  local usable = [];
+  local engines = AIEngineList(AIVehicle.VT_ROAD);
+  engines.Valuate(AIEngine.IsBuildable);
+  engines.KeepValue(1);
+  engines.Valuate(AIEngine.IsArticulated);
+  engines.KeepValue(0);
+  for (local e = engines.Begin(); !engines.IsEnd(); e = engines.Next()) {
+    if (!AIEngine.CanRunOnRoad(e, this.roadType)) continue;
+    if (!AIEngine.HasPowerOnRoad(e, this.roadType)) continue;
+    local capacity = AIEngine.GetCapacity(e);
+    if (capacity <= 0) continue;
+    usable.append({
+      id = e, defaultCargo = AIEngine.GetCargoType(e), capacity = capacity,
+      speed = AIEngine.GetMaxSpeed(e), price = AIEngine.GetPrice(e),
+      runningCost = AIEngine.GetRunningCost(e),
+      /* GetMaxAge rend des jours, comme pour la locomotive. */
+      ageYears = AIEngine.GetMaxAge(e) / 365,
+    });
+  }
+
+  foreach (cargo in this.cargos) {
+    local best = null;
+    local probeChoices = [];
+    foreach (engine in usable) {
+      if (engine.defaultCargo != cargo && !AIEngine.CanRefitCargo(engine.id, cargo)) continue;
+      if (EQUIPMENT_ROI_PROBE) probeChoices.append(engine);
+      /* capacity est celle du cargo D'ORIGINE : apres refit elle peut changer (le GRF decide).
+       * C'est une approximation assumee pour le CLASSEMENT ; la valeur qui sert au dimensionnement
+       * reel est relue depuis le depot par GetBuildWithRefitCapacity dans builder_road.nut. */
+      if (best == null || engine.capacity > best.capacity ||
+          (engine.capacity == best.capacity && engine.speed > best.speed)) {
+        best = engine;
+      }
+    }
+    if (best == null) continue;
+    this.roadEngineByCargo.rawset(cargo, best);
+    if (EQUIPMENT_ROI_PROBE) this.roadEngineChoicesByCargo.rawset(cargo, probeChoices);
+    if (best.price > this.maxRoadVehiclePrice) this.maxRoadVehiclePrice = best.price;
+  }
+}
+
+function OpexCatalog::_refreshCargos()
+{
+  this.cargos = [];
+  this.paxCargo = -1;
+  this.mailCargo = -1;
+  local list = AICargoList();
+  for (local c = list.Begin(); !list.IsEnd(); c = list.Next()) {
+    this.cargos.append(c);
+    if (this.paxCargo < 0 && AICargo.HasCargoClass(c, AICargo.CC_PASSENGERS)) this.paxCargo = c;
+    if (this.mailCargo < 0 && AICargo.HasCargoClass(c, AICargo.CC_MAIL)) this.mailCargo = c;
+  }
+}
+
+function OpexCatalog::_refreshTowns()
+{
+  this.towns = [];
+  this.townAcceptors = {};
+  local list = AITownList();
+  for (local t = list.Begin(); !list.IsEnd(); t = list.Next()) {
+    local townMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+    local tile = AITown.GetLocation(t);
+    local pop = AITown.GetPopulation(t);
+    local houses = AITown.GetHouseCount(t);
+    local townObj = {
+      id = t,
+      tile = tile,
+      pop = pop,
+      houses = houses,
+    };
+    this.towns.append(townObj);
+
+    /* Indexation des marchandises complexes et cargos urbains acceptes par la ville (Goods, Food, Mail, etc.) */
+    foreach (cargo in this.cargos) {
+      if (cargo == this.paxCargo) continue;
+      local acceptance = AITile.GetCargoAcceptance(tile, cargo, 2, 2, this.railCoverage > 0 ? this.railCoverage : 4);
+      local acceptValid = acceptance >= 8; // EB-10 (adopte le 20/11/2026) : plus d'acceptation express fictive.
+      if (acceptValid) {
+        if (!(cargo in this.townAcceptors)) this.townAcceptors.rawset(cargo, []);
+        this.townAcceptors[cargo].append(townObj);
+      }
+    }
+    if (townMark != null) OpexSpanAgg("catalog.town", townMark);
+  }
+  /* Hors de la boucle : au defaut, un seul test par rafraichissement (identite des opcodes). */
+  OpexC121CatalogSeedTownPopulations(this.towns);
+}
+
+/* Revision par ville : 5 % et au moins 20 habitants, pour eviter les oscillations
+ * des tres petites villes. */
+function OpexC121CatalogSeedTownPopulations(towns)
+{
+  foreach (town in towns) {
+    local t = town.id;
+    local pop = town.pop;
+    local previous = t in C121_CATALOG_TOWN_POP ? C121_CATALOG_TOWN_POP[t] : -1;
+    if (previous < 0 || abs(pop - previous) >= 20
+        && abs(pop - previous) * 100 >= previous * 5) {
+      C121_CATALOG_TOWN_POP.rawset(t, pop);
+      C121_CATALOG_TOWN_REV.rawset(t,
+          (t in C121_CATALOG_TOWN_REV ? C121_CATALOG_TOWN_REV[t] : 0) + 1);
+    }
+  }
+}
+
+/* Huit villes au plus par tour catalogue. La production n'a pas d'evenement
+ * NoAI ; chaque ville revient au plus apres ceil(N/8) tours utiles. */
+function OpexC121CatalogTownProductionBatch(catalog)
+{
+  if (catalog == null || catalog.towns == null || catalog.towns.len() == 0 || catalog.paxCargo < 0) return false;
+  local count = catalog.towns.len();
+  local changed = false;
+  for (local i = 0; i < 8 && i < count; i++) {
+    local index = (C121_CATALOG_TOWN_CURSOR + i) % count;
+    local id = catalog.towns[index].id;
+    local population = AITown.GetPopulation(id);
+    if (population >= 0 && id in C121_CATALOG_TOWN_POP) {
+      local oldPopulation = C121_CATALOG_TOWN_POP[id];
+      if (abs(population - oldPopulation) >= 20
+          && abs(population - oldPopulation) * 100 >= oldPopulation * 5) {
+        C121_CATALOG_TOWN_POP.rawset(id, population);
+        C121_CATALOG_TOWN_REV.rawset(id,
+            (id in C121_CATALOG_TOWN_REV ? C121_CATALOG_TOWN_REV[id] : 0) + 1);
+        changed = true;
+      }
+    }
+    local pax = AITown.GetLastMonthProduction(id, catalog.paxCargo);
+    local mail = catalog.mailCargo >= 0
+        ? AITown.GetLastMonthProduction(id, catalog.mailCargo) : 0;
+    if (pax < 0) pax = 0;
+    if (mail < 0) mail = 0;
+    if (id in C121_CATALOG_TOWN_PROD) {
+      local old = C121_CATALOG_TOWN_PROD[id];
+      /* La demande C121 emploie le volume mensuel, mais une oscillation de
+       * quelques unites ne change pas materiellement le choix d'un avion.
+       * Comparer au dernier volume ayant invalide le plan, pas au mois
+       * precedent : les petites variations finissent ainsi par s'accumuler. */
+      if ((abs(pax - old.pax) >= 10 && abs(pax - old.pax) * 100 >= old.pax * 20)
+          || (abs(mail - old.mail) >= 10 && abs(mail - old.mail) * 100 >= old.mail * 20)) {
+        C121_CATALOG_TOWN_REV.rawset(id,
+            (id in C121_CATALOG_TOWN_REV ? C121_CATALOG_TOWN_REV[id] : 0) + 1);
+        C121_CATALOG_TOWN_PROD.rawset(id, { pax = pax, mail = mail });
+        changed = true;
+      }
+    } else C121_CATALOG_TOWN_PROD.rawset(id, { pax = pax, mail = mail });
+  }
+  C121_CATALOG_TOWN_CURSOR = (C121_CATALOG_TOWN_CURSOR + 8) % count;
+  return changed;
+}
+
+function OpexCatalog::_refreshIndustries()
+{
+  /* Les producteurs et les volumes qui ordonnent V276 viennent de ce catalogue. */
+  V276_CARGO_ORDER = null;
+  this.industries = [];
+  this.producers = {};
+  this.acceptors = {};
+
+  local list = AIIndustryList();
+  for (local i = list.Begin(); !list.IsEnd(); i = list.Next()) {
+    if (!AIIndustry.IsValidIndustry(i)) continue;
+    local type = AIIndustry.GetIndustryType(i);
+    if (!AIIndustryType.IsValidIndustryType(type)) continue;
+    this.industries.append({ id = i, tile = AIIndustry.GetLocation(i), type = type });
+  }
+
+  /* Les cargos produits/acceptes se lisent sur le TYPE d'industrie, pas sur l'instance
+   * (AIIndustry.IsCargoProduced n'existe pas). On memorise par type : il y a une poignee de
+   * types pour des dizaines d'industries, donc les listes ne sont lues qu'une fois chacune. */
+  local producedByType = {};
+  local acceptedByType = {};
+  for (local k = 0; k < this.industries.len(); k++) {
+    local industryMark = PROBE_SPAN_TRACE ? OpexOpsMeasureBegin() : null;
+    local type = this.industries[k].type;
+    if (!(type in producedByType)) {
+      local prodList = AIIndustryType.IsValidIndustryType(type) ? AIIndustryType.GetProducedCargo(type) : null;
+      local accList = AIIndustryType.IsValidIndustryType(type) ? AIIndustryType.GetAcceptedCargo(type) : null;
+      producedByType.rawset(type, this._cargoArray(prodList));
+      acceptedByType.rawset(type, this._cargoArray(accList));
+    }
+    local isTransformer = (producedByType[type].len() > 0 && acceptedByType[type].len() > 0);
+    this.industries[k].isTransformer <- isTransformer;
+    foreach (cargo in producedByType[type]) {
+      if (!(cargo in this.producers)) this.producers.rawset(cargo, []);
+      this.producers[cargo].append(k);
+    }
+    foreach (cargo in acceptedByType[type]) {
+      if (!(cargo in this.acceptors)) this.acceptors.rawset(cargo, []);
+      this.acceptors[cargo].append(k);
+    }
+    if (industryMark != null) OpexSpanAgg("catalog.industry", industryMark);
+  }
+}
+
+function OpexCatalog::_cargoArray(list)
+{
+  local out = [];
+  if (list == null) return out;
+  for (local c = list.Begin(); !list.IsEnd(); c = list.Next()) out.append(c);
+  return out;
+}
+
+function OpexCatalog::refresh(budget, year)
+{
+  local spRefresh = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh") : null;
+  local spStep = null;
+  this.year = year;
+
+  budget.begin();
+  spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.cargos") : null;
+  this._refreshCargos();
+  if (spStep != null) OpexSpanEnd(spStep);
+  budget.end("cat_cargos");
+
+  budget.begin();
+  spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.rail") : null;
+  this._refreshRail();
+  if (spStep != null) OpexSpanEnd(spStep);
+  budget.end("cat_rail");
+
+  budget.begin();
+  spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.towns") : null;
+  this._refreshTowns();
+  if (spStep != null) OpexSpanEnd(spStep);
+  if (CATALOG_COST_ACTIVE != null) CATALOG_COST_ACTIVE.catalogTowns = this.towns.len();
+  budget.end("cat_towns");
+
+  budget.begin();
+  spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.industries") : null;
+  this._refreshIndustries();
+  if (spStep != null) OpexSpanEnd(spStep);
+  if (CATALOG_COST_ACTIVE != null) CATALOG_COST_ACTIVE.catalogIndustries = this.industries.len();
+  budget.end("cat_industries");
+
+  budget.begin();
+  local airRefreshMark = CATALOG_COST_ACTIVE != null ? OpexOpsMeasureBegin() : null;
+  spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.air") : null;
+  this._refreshAir();
+  {
+    foreach (airportType, choices in this.airPlaneChoicesByAirport) {
+      local prices = "";
+      foreach (plane in choices) prices += plane.id + ":" + plane.price + ":" + plane.runningCost + ";";
+      if (!(airportType in C121_CATALOG_AIRPORT_PRICES)
+          || C121_CATALOG_AIRPORT_PRICES[airportType] != prices) {
+        C121_CATALOG_AIRPORT_PRICES.rawset(airportType, prices);
+        C121_CATALOG_AIRPORT_REV.rawset(airportType,
+            (airportType in C121_CATALOG_AIRPORT_REV
+                ? C121_CATALOG_AIRPORT_REV[airportType] : 0) + 1);
+      }
+    }
+  }
+  if (CATALOG_COST_ACTIVE != null) {
+    CATALOG_COST_ACTIVE.engineRefreshOps += OpexOpsMeasureEnd(airRefreshMark);
+    CATALOG_COST_ACTIVE.engineChoices = 0;
+    foreach (airportType, choices in this.airPlaneChoicesByAirport)
+      CATALOG_COST_ACTIVE.engineChoices += choices.len();
+  }
+  if (spStep != null) OpexSpanEnd(spStep);
+  budget.end("cat_air");
+
+  budget.begin();
+  spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.water") : null;
+  this._refreshWater();
+  if (spStep != null) OpexSpanEnd(spStep);
+  budget.end("cat_water");
+
+  /* Le catalogue route n'est rafraichi que si le mode est actif : a road_mode = 0, le chemin
+   * d'opcodes de la baseline rail reste EXACTEMENT celui des campagnes anterieures, ce qui rend le
+   * banc apparie lisible (une trajectoire ne diverge que par une decision, pas par un debit). */
+  if (ROAD_BUILD_ENABLED) {
+    budget.begin();
+    spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.road") : null;
+    this._refreshRoad();
+    if (spStep != null) OpexSpanEnd(spStep);
+    budget.end("cat_road");
+  } else if (AIRoad.IsRoadTypeAvailable(AIRoad.ROADTYPE_ROAD)) {
+    /* Sans catalogue route, aucun type de route courant n'est pose : les arrets joints aux
+     * aeroports (et leur prevision B9) echouaient alors tous en silence. Ce sont des arrets de
+     * l'aeroport, sans vehicule routier : un banc air seul (mode_road = 0) doit les garder. */
+    AIRoad.SetCurrentRoadType(AIRoad.ROADTYPE_ROAD);
+  }
+
+  budget.begin();
+  spStep = PROBE_SPAN_TRACE ? OpexSpanBegin("catalog.refresh.bounds") : null;
+  OpexRefreshEpochBounds(this);
+  if (spStep != null) OpexSpanEnd(spStep);
+  budget.end("cat_bounds");
+  if (spRefresh != null) OpexSpanEnd(spRefresh);
+}
