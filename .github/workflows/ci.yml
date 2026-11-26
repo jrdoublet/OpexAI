@@ -1,65 +1,71 @@
-name: CI
+# Public repository CI. Three jobs: package checks, leak scan, one headless year.
+# Game data comes from the official CDN. The content catalogue is not used.
+name: OpexAI public CI
 
-on:
-  push:
-  pull_request:
+on: [push, pull_request, workflow_dispatch]
 
 permissions:
   contents: read
 
 jobs:
-  check-and-package:
+  package:
+    name: Package validation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Check required files exist
-        run: |
-          for f in \
-            ai/OpexAI/info.nut \
-            ai/OpexAI/main.nut \
-            LICENSE \
-            ai/OpexAI/readme.txt \
-            ai/OpexAI/changelog.txt
-          do
-            if [ ! -f "$f" ]; then
-              echo "ERROR: missing required file: $f" >&2
-              exit 1
-            fi
-          done
-          echo "OK: all required files present"
-
-      - name: Check ASCII encoding and SPDX headers
-        run: python3 .github/scripts/check_nut.py --ascii-spdx ai/OpexAI
-
-      - name: Check Squirrel bracket balance
-        run: python3 .github/scripts/check_nut.py --brackets ai/OpexAI
-
-      - name: Build reproducible tar archive and MD5
-        id: package
-        run: |
-          VERSION="$(python3 -c '
-          import re, sys
-          from pathlib import Path
-          text = Path("ai/OpexAI/info.nut").read_text(encoding="ascii")
-          m = re.search(r"function\s+GetVersion\s*\(\s*\)\s*\{\s*return\s+([0-9]+)\s*;\s*\}", text)
-          if not m:
-              sys.exit("ERROR: GetVersion() not found in ai/OpexAI/info.nut")
-          print(m.group(1))
-          ')"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          mkdir -p dist
-          ARCHIVE="OpexAI-${VERSION}.tar"
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-            -cf "dist/${ARCHIVE}" -C ai OpexAI
-          (cd dist && md5sum "${ARCHIVE}" > "${ARCHIVE}.md5" && cat "${ARCHIVE}.md5")
-
-      - name: Upload OpexAI archive artifact
-        uses: actions/upload-artifact@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: OpexAI-${{ steps.package.outputs.version }}
-          path: |
-            dist/OpexAI-${{ steps.package.outputs.version }}.tar
-            dist/OpexAI-${{ steps.package.outputs.version }}.tar.md5
-          if-no-files-found: error
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Validate the AI archive
+        run: python tools/ci_validate.py
+
+  leak-scan:
+    name: Leak scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Planted leak must fail the scan
+        run: python tools/ci_validate.py --prove-leak-scan
+
+      - name: Scan this tree
+        run: python tools/leak_scan.py .
+
+  smoke:
+    name: Smoke 1x1
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the headless runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates xz-utils unzip libfluidsynth3
+
+      - name: Run one short game
+        run: python tools/ci_smoke.py --years 1 --map-log2 8 --seed 42
