@@ -7,6 +7,10 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 
+# No bytecode cache: the leak scan must only see the checked-out tree.
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   package:
     name: Package validation
